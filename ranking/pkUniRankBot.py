@@ -9,6 +9,7 @@ from typing import Dict, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 import numpy as np
+from dotenv import dotenv_values
 
 # Import for telegram bot v13.15
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
@@ -25,7 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+all_secrets = dotenv_values(".env.dev")
+BOT_TOKEN = all_secrets['BOT_TOKEN']
 
 # Conversation states
 AWAITING_UNIVERSITY, AWAITING_COUNTRY = range(2)
