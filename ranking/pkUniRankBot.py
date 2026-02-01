@@ -45,6 +45,7 @@ from googlesearch import search
 import json
 import urllib.parse
 from threading import Lock
+from queue import Queue
 from collections import defaultdict
 from enum import Enum
 import threading
@@ -67,7 +68,7 @@ from telegram.ext import (
 # Configure logging with more detailed format
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-    level=logging.DEBUG
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,64 @@ BOT_TOKEN = all_secrets['BOT_TOKEN']
 
 # Conversation states
 AWAITING_UNIVERSITY, AWAITING_COUNTRY = range(2)
+
+# ============================================================================
+# USER CONFIGURATION CLASS
+# ============================================================================
+
+class UserConfiguration:
+    """Stores user preferences for data sources"""
+    
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        # Default settings: Wikipedia enabled, Google and Webometrics disabled
+        self.enable_wikipedia = True
+        self.enable_google_search = False
+        self.enable_webometrics = False
+        self.timestamp = datetime.now()
+        logger.info(f"Created default configuration for user {user_id}")
+    
+    def to_dict(self) -> Dict:
+        """Convert configuration to dictionary"""
+        return {
+            'user_id': self.user_id,
+            'enable_wikipedia': self.enable_wikipedia,
+            'enable_google_search': self.enable_google_search,
+            'enable_webometrics': self.enable_webometrics,
+            'timestamp': self.timestamp.isoformat()
+        }
+    
+    def from_dict(self, data: Dict):
+        """Load configuration from dictionary"""
+        self.enable_wikipedia = data.get('enable_wikipedia', True)
+        self.enable_google_search = data.get('enable_google_search', False)
+        self.enable_webometrics = data.get('enable_webometrics', False)
+        if 'timestamp' in data:
+            self.timestamp = datetime.fromisoformat(data['timestamp'])
+        logger.info(f"Loaded configuration for user {self.user_id}: {self.to_dict()}")
+    
+    def update_source(self, source: str, enabled: bool):
+        """Update a specific data source setting"""
+        if source == 'wikipedia':
+            self.enable_wikipedia = enabled
+        elif source == 'google_search':
+            self.enable_google_search = enabled
+        elif source == 'webometrics':
+            self.enable_webometrics = enabled
+        self.timestamp = datetime.now()
+        logger.info(f"Updated {source} to {enabled} for user {self.user_id}")
+    
+    def get_enabled_sources(self) -> List[str]:
+        """Get list of enabled data sources"""
+        sources = []
+        if self.enable_wikipedia:
+            sources.append('wikipedia')
+        if self.enable_google_search:
+            sources.append('google_search')
+        if self.enable_webometrics:
+            sources.append('webometrics')
+        logger.debug(f"Enabled sources for user {self.user_id}: {sources}")
+        return sources
 
 @dataclass
 class UniversityData:
@@ -93,6 +152,7 @@ class UniversityData:
     is_estimated: bool = True
     real_data_sources: List[str] = None
     rate_limit_info: List[Dict] = None
+    data_sources_used: List[str] = None  # Track which sources were actually used
 
 # ============================================================================
 # PROGRESS TRACKING CLASS
@@ -421,11 +481,11 @@ class RateLimiter:
         return None
 
 # ============================================================================
-# DATA FETCHER WITH RATE LIMITING
+# DATA FETCHER WITH RATE LIMITING AND USER CONFIGURATION
 # ============================================================================
 
 class RateLimitedDataFetcher:
-    """Fetches real university data with rate limiting"""
+    """Fetches real university data with rate limiting and user configuration"""
     
     def __init__(self):
         logger.info("Initializing RateLimitedDataFetcher")
@@ -618,82 +678,104 @@ class RateLimitedDataFetcher:
         
         return None
     
-    def fetch_all_data(self, university_name: str, country: str, user_id: Optional[str] = None) -> Tuple[Dict, List[Dict]]:
-        """Fetch data from all sources with rate limiting"""
+    def fetch_all_data(self, university_name: str, country: str, user_id: Optional[str] = None, 
+                      user_config: Optional[UserConfiguration] = None) -> Tuple[Dict, List[Dict]]:
+        """Fetch data from enabled sources with rate limiting based on user configuration"""
         logger.info(f"Starting data fetch for {university_name} in {country}")
         all_data = {}
         rate_limit_info = []
+        data_sources_used = []
         
-        # Fetch Wikipedia data
-        logger.debug(f"Attempting Wikipedia fetch for {university_name}")
-        try:
-            wiki_data = self.safe_fetch_wikipedia(university_name, user_id)
-            if wiki_data:
-                all_data.update(wiki_data)
-                rate_limit_info.append(self.rate_limiter.get_api_status(APIType.WIKIPEDIA))
-                logger.info(f"Wikipedia data fetched successfully for {university_name}")
-        except RateLimitExceededException as e:
-            rate_limit_info.append({
-                'api': 'wikipedia',
-                'status': 'rate_limited',
-                'reset_time': e.reset_time,
-                'message': str(e)
-            })
-            logger.warning(f"Wikipedia rate limited for {university_name}")
+        # Use default configuration if none provided
+        if user_config is None:
+            user_config = UserConfiguration(user_id)
         
-        # Fetch Google search results
-        queries = [
-            f"{university_name} QS World University Rankings",
-            f"{university_name} Times Higher Education ranking",
-            f"{university_name} ARWU ranking"
-        ]
-        
-        google_results = {}
-        logger.debug(f"Preparing {len(queries)} Google search queries")
-        for i, query in enumerate(queries, 1):
+        # Fetch Wikipedia data if enabled
+        if user_config.enable_wikipedia:
+            logger.debug(f"Wikipedia enabled, attempting fetch for {university_name}")
             try:
-                logger.debug(f"Google search {i}/{len(queries)}: {query}")
-                results = self.safe_google_search(query, user_id)
-                if results:
-                    google_results[query] = results
-                    logger.debug(f"Google search {i} returned {len(results)} results")
-                rate_limit_info.append(self.rate_limiter.get_api_status(APIType.GOOGLE_SEARCH))
+                wiki_data = self.safe_fetch_wikipedia(university_name, user_id)
+                if wiki_data:
+                    all_data.update(wiki_data)
+                    data_sources_used.append('wikipedia')
+                    rate_limit_info.append(self.rate_limiter.get_api_status(APIType.WIKIPEDIA))
+                    logger.info(f"Wikipedia data fetched successfully for {university_name}")
             except RateLimitExceededException as e:
                 rate_limit_info.append({
-                    'api': 'google_search',
+                    'api': 'wikipedia',
                     'status': 'rate_limited',
                     'reset_time': e.reset_time,
                     'message': str(e)
                 })
-                logger.warning(f"Google search rate limited on query {i}")
-                break  # Stop further Google searches
+                logger.warning(f"Wikipedia rate limited for {university_name}")
+        else:
+            logger.debug(f"Wikipedia disabled for user {user_id}, skipping fetch")
         
-        if google_results:
-            all_data['google_search'] = google_results
-            logger.info(f"Google searches completed, found data for {len(google_results)} queries")
+        # Fetch Google search results if enabled
+        if user_config.enable_google_search:
+            queries = [
+                f"{university_name} QS World University Rankings",
+                f"{university_name} Times Higher Education ranking",
+                f"{university_name} ARWU ranking"
+            ]
+            
+            google_results = {}
+            logger.debug(f"Google search enabled, preparing {len(queries)} queries")
+            for i, query in enumerate(queries, 1):
+                try:
+                    logger.debug(f"Google search {i}/{len(queries)}: {query}")
+                    results = self.safe_google_search(query, user_id)
+                    if results:
+                        google_results[query] = results
+                        logger.debug(f"Google search {i} returned {len(results)} results")
+                    rate_limit_info.append(self.rate_limiter.get_api_status(APIType.GOOGLE_SEARCH))
+                except RateLimitExceededException as e:
+                    rate_limit_info.append({
+                        'api': 'google_search',
+                        'status': 'rate_limited',
+                        'reset_time': e.reset_time,
+                        'message': str(e)
+                    })
+                    logger.warning(f"Google search rate limited on query {i}")
+                    break  # Stop further Google searches
+            
+            if google_results:
+                all_data['google_search'] = google_results
+                data_sources_used.append('google_search')
+                logger.info(f"Google searches completed, found data for {len(google_results)} queries")
+        else:
+            logger.debug(f"Google search disabled for user {user_id}, skipping fetch")
         
-        # Try Webometrics
-        logger.debug(f"Attempting Webometrics fetch for {university_name}")
-        try:
-            web_data = self.safe_fetch_webometrics(university_name, user_id)
-            if web_data:
-                all_data.update(web_data)
-                rate_limit_info.append(self.rate_limiter.get_api_status(APIType.WEBOMETRICS))
-                logger.info(f"Webometrics data fetched successfully for {university_name}")
-        except RateLimitExceededException as e:
-            rate_limit_info.append({
-                'api': 'webometrics',
-                'status': 'rate_limited',
-                'reset_time': e.reset_time,
-                'message': str(e)
-            })
-            logger.warning(f"Webometrics rate limited for {university_name}")
+        # Try Webometrics if enabled
+        if user_config.enable_webometrics:
+            logger.debug(f"Webometrics enabled, attempting fetch for {university_name}")
+            try:
+                web_data = self.safe_fetch_webometrics(university_name, user_id)
+                if web_data:
+                    all_data.update(web_data)
+                    data_sources_used.append('webometrics')
+                    rate_limit_info.append(self.rate_limiter.get_api_status(APIType.WEBOMETRICS))
+                    logger.info(f"Webometrics data fetched successfully for {university_name}")
+            except RateLimitExceededException as e:
+                rate_limit_info.append({
+                    'api': 'webometrics',
+                    'status': 'rate_limited',
+                    'reset_time': e.reset_time,
+                    'message': str(e)
+                })
+                logger.warning(f"Webometrics rate limited for {university_name}")
+        else:
+            logger.debug(f"Webometrics disabled for user {user_id}, skipping fetch")
         
-        logger.info(f"Data fetch completed for {university_name}. Got data from {len(all_data)} sources")
+        # Add data sources used to the result
+        if data_sources_used:
+            all_data['data_sources_used'] = data_sources_used
+        
+        logger.info(f"Data fetch completed for {university_name}. Got data from {len(data_sources_used)} enabled sources: {data_sources_used}")
         return all_data, rate_limit_info
 
 # ============================================================================
-# ENHANCED UNIVERSITY RANKING SYSTEM
+# ENHANCED UNIVERSITY RANKING SYSTEM WITH USER CONFIGURATION
 # ============================================================================
 
 class UniversityRankingSystem:
@@ -998,7 +1080,8 @@ class UniversityRankingSystem:
         return uni_type
     
     def generate_rationale_for_score(self, param_code: str, score: float, max_score: float, 
-                                   university_name: str, country: str, is_estimated: bool) -> List[str]:
+                                   university_name: str, country: str, is_estimated: bool,
+                                   data_sources_used: List[str] = None) -> List[str]:
         """Generate rationale for a parameter score"""
         logger.debug(f"Generating rationale for {param_code} (score: {score}/{max_score})")
         rationale = []
@@ -1021,8 +1104,10 @@ class UniversityRankingSystem:
             rationale.append(f"Below average performance ({percentage:.1f}% of max)")
             rationale.append("Significant improvement needed")
         
-        # Add estimation note if applicable
-        if is_estimated:
+        # Add data sources information
+        if data_sources_used:
+            rationale.append(f"Data sources: {', '.join(data_sources_used)}")
+        elif is_estimated:
             rationale.append("Score based on pattern analysis and estimation")
             rationale.append("Actual performance may vary")
         
@@ -1116,8 +1201,8 @@ class UniversityRankingSystem:
         logger.debug(f"Score {score} falls in default tier D")
         return 'D', self.tiers['D'][2]
     
-    def calculate_error_margin(self, university_name: str, country: str) -> float:
-        """Calculate error margin"""
+    def calculate_error_margin(self, university_name: str, country: str, data_sources_used: List[str] = None) -> float:
+        """Calculate error margin based on data sources used"""
         name_lower = university_name.lower()
         
         if name_lower in self.university_db:
@@ -1125,11 +1210,25 @@ class UniversityRankingSystem:
             logger.debug(f"Known university {university_name}, error margin: {error}")
             return error
         else:
+            # Base error based on data sources
+            if data_sources_used and 'wikipedia' in data_sources_used:
+                base_error = 5.0
+                logger.debug(f"Wikipedia data used for {university_name}, base error: {base_error}")
+            else:
+                base_error = 10.0
+                logger.debug(f"No Wikipedia data for {university_name}, base error: {base_error}")
+            
+            # Adjust based on number of data sources
+            if data_sources_used:
+                source_count = len(data_sources_used)
+                if source_count >= 2:
+                    base_error *= 0.7  # More sources = lower error
+                    logger.debug(f"Multiple data sources ({source_count}), error reduced")
+            
             country_mult = 1.0
             if country:
                 country_mult = self.country_multipliers.get(country.upper(), 1.0)
-            
-            base_error = 8.0 / country_mult
+                base_error /= country_mult
             
             if 'university' in name_lower:
                 base_error *= 0.9
@@ -1137,14 +1236,25 @@ class UniversityRankingSystem:
                 base_error *= 1.1
             
             error = round(min(15.0, max(3.0, base_error + np.random.uniform(-2.0, 2.0))), 1)
-            logger.debug(f"Unknown university {university_name}, error margin: {error}")
+            logger.debug(f"Final error margin for {university_name}: {error}")
             return error
     
-    def get_sources_for_university(self, university_name: str, is_estimated: bool) -> List[str]:
+    def get_sources_for_university(self, university_name: str, is_estimated: bool, 
+                                 data_sources_used: List[str] = None) -> List[str]:
         """Get data sources for university ranking"""
         sources = []
         
-        if not is_estimated:
+        if data_sources_used:
+            # Add actual data sources used
+            for source in data_sources_used:
+                if source == 'wikipedia':
+                    sources.append("Wikipedia academic database")
+                elif source == 'google_search':
+                    sources.append("Google search results for rankings")
+                elif source == 'webometrics':
+                    sources.append("Webometrics ranking system")
+            logger.debug(f"Using real data sources for {university_name}: {data_sources_used}")
+        elif not is_estimated:
             sources.extend([
                 "Institutional annual reports",
                 "Accreditation agency data",
@@ -1168,7 +1278,7 @@ class UniversityRankingSystem:
         return sources
 
 # ============================================================================
-# ENHANCED RANKING SYSTEM WITH REAL DATA FETCHING
+# ENHANCED RANKING SYSTEM WITH REAL DATA FETCHING AND USER CONFIGURATION
 # ============================================================================
 
 class EnhancedUniversityRankingSystem(UniversityRankingSystem):
@@ -1184,8 +1294,10 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
         self.cache_lock = Lock()
         logger.info("EnhancedUniversityRankingSystem initialized")
     
-    def fetch_real_data(self, university_name: str, country: str, user_id: Optional[str] = None) -> Tuple[Dict, List[Dict]]:
-        """Fetch real data from multiple sources with rate limiting"""
+    def fetch_real_data(self, university_name: str, country: str, 
+                       user_id: Optional[str] = None,
+                       user_config: Optional[UserConfiguration] = None) -> Tuple[Dict, List[Dict]]:
+        """Fetch real data from enabled sources with rate limiting"""
         logger.info(f"Fetching real data for: {university_name} (Country: {country})")
         cache_key = f"{university_name.lower()}_{country.lower()}"
         
@@ -1199,8 +1311,10 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
                 return cached_data, rate_info
         
         logger.info(f"Cache miss for {university_name}, fetching fresh data")
-        # Fetch fresh data
-        all_data, rate_limit_info = self.data_fetcher.fetch_all_data(university_name, country, user_id)
+        # Fetch fresh data with user configuration
+        all_data, rate_limit_info = self.data_fetcher.fetch_all_data(
+            university_name, country, user_id, user_config
+        )
         
         # Check known rankings
         name_lower = university_name.lower()
@@ -1306,23 +1420,33 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
         logger.info(f"Calculated scores from real data for {university_name}: {rounded_scores}")
         return rounded_scores
     
-    def rank_university(self, university_name: str, country: str = "", user_id: Optional[str] = None) -> UniversityData:
-        """Enhanced ranking function with real data fetching and rate limiting"""
+    def rank_university(self, university_name: str, country: str = "", 
+                       user_id: Optional[str] = None,
+                       user_config: Optional[UserConfiguration] = None) -> UniversityData:
+        """Enhanced ranking function with real data fetching and user configuration"""
         logger.info(f"Starting ranking process for: {university_name} (Country: {country}, User: {user_id})")
         name_lower = university_name.lower()
         
-        # Try to fetch real data first
-        logger.debug(f"Attempting to fetch real data for {university_name}")
-        real_data, rate_limit_info = self.fetch_real_data(university_name, country, user_id)
+        # Use default configuration if none provided
+        if user_config is None:
+            user_config = UserConfiguration(user_id)
+            logger.debug(f"Using default configuration for user {user_id}")
         
-        has_real_data = bool(real_data and ('qs_ranking' in real_data or 'the_ranking' in real_data or 'wikipedia' in real_data))
+        # Try to fetch real data from enabled sources
+        logger.debug(f"Attempting to fetch real data for {university_name} with config: {user_config.to_dict()}")
+        real_data, rate_limit_info = self.fetch_real_data(university_name, country, user_id, user_config)
+        
+        # Determine which data sources were actually used
+        data_sources_used = real_data.get('data_sources_used', []) if real_data else []
+        
+        has_real_data = bool(real_data and data_sources_used)
         
         if has_real_data:
             # Calculate scores from real data
-            logger.info(f"Using real data for {university_name}")
+            logger.info(f"Using real data for {university_name} from sources: {data_sources_used}")
             scores = self.calculate_scores_from_real_data(university_name, country, real_data)
             is_estimated = False
-            data_sources = ["QS World University Rankings", "Times Higher Education", "Wikipedia"]
+            data_sources = ["Real-time data fetching"]
         elif name_lower in self.university_db:
             # Use database entry
             logger.info(f"Using database entry for {university_name}")
@@ -1344,14 +1468,16 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
             real_sources.append(f"Wikipedia: {real_data['wikipedia'].get('url', '')}")
         if 'google_search' in real_data:
             real_sources.append("Google Search Results for rankings")
+        if 'webometrics' in real_data:
+            real_sources.append("Webometrics Ranking System")
         
-        # Generate rationale
+        # Generate rationale with data sources information
         logger.debug(f"Generating rationale for {university_name}")
         rationale = {}
         for param_code, score in scores.items():
             max_score = self.parameters[param_code]['max']
             rationale[param_code] = self.generate_rationale_for_score(
-                param_code, score, max_score, university_name, country, is_estimated
+                param_code, score, max_score, university_name, country, is_estimated, data_sources_used
             )
         
         # Add real data sources to rationale if available
@@ -1362,12 +1488,17 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
         logger.debug(f"Calculating final metrics for {university_name}")
         composite = self.calculate_composite_score(scores)
         tier, tier_desc = self.get_tier(composite)
-        error_margin = self.calculate_error_margin(university_name, country)
+        
+        # Calculate error margin based on data sources used
+        error_margin = self.calculate_error_margin(university_name, country, data_sources_used)
         
         # Lower error margin if we have real data
-        if not is_estimated:
-            error_margin = max(1.0, error_margin * 0.5)
+        if data_sources_used:
+            error_margin = max(1.0, error_margin * 0.7)
             logger.debug(f"Reduced error margin for real data: {error_margin}")
+        
+        # Get sources with data sources used info
+        sources = self.get_sources_for_university(university_name, is_estimated, data_sources_used)
         
         result = UniversityData(
             name=university_name,
@@ -1379,17 +1510,19 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
             error_margin=error_margin,
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             rationale=rationale,
-            sources=data_sources,
+            sources=sources,
             is_estimated=is_estimated,
             real_data_sources=real_sources,
-            rate_limit_info=rate_limit_info
+            rate_limit_info=rate_limit_info,
+            data_sources_used=data_sources_used  # Track which sources were actually used
         )
         
-        logger.info(f"Ranking complete for {university_name}: Score={composite}, Tier={tier}, Estimated={is_estimated}")
+        logger.info(f"Ranking complete for {university_name}: Score={composite}, Tier={tier}, Estimated={is_estimated}, Sources={data_sources_used}")
         return result
     
     def process_excel_file(self, input_path: str, user_id: Optional[str] = None, 
-                          progress_callback: Optional[callable] = None) -> Tuple[str, List[Dict]]:
+                          progress_callback: Optional[callable] = None,
+                          user_config: Optional[UserConfiguration] = None) -> Tuple[str, List[Dict]]:
         """Process Excel file with multiple universities and progress tracking"""
         logger.info(f"Processing Excel file: {input_path} for user: {user_id}")
         
@@ -1405,6 +1538,11 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
             total_universities = len(result_df)
             progress_tracker = ProgressTracker(total_universities, "University Ranking")
             
+            # Use default configuration if none provided
+            if user_config is None:
+                user_config = UserConfiguration(user_id)
+                logger.debug(f"Using default configuration for Excel processing for user {user_id}")
+            
             # Initial progress update
             if progress_callback:
                 progress_callback(progress_tracker.get_progress_message())
@@ -1417,6 +1555,7 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
             result_df['Rate Limited'] = 'No'
             result_df['Processing Time (s)'] = 0.0
             result_df['Error'] = ''
+            result_df['Data Sources Used'] = ''  # Track which sources were used
             
             rate_limit_issues = []
             
@@ -1427,13 +1566,18 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
                     
                     logger.info(f"Processing {idx+1}/{total_universities}: {university_name}")
                     
-                    # Check rate limits before processing
+                    # Check rate limits before processing (only for enabled sources)
                     rate_limit_hit = False
                     try:
-                        # Check Wikipedia rate limit
-                        self.data_fetcher.rate_limiter.check_rate_limit(APIType.WIKIPEDIA, user_id)
-                        # Check Google rate limit
-                        self.data_fetcher.rate_limiter.check_rate_limit(APIType.GOOGLE_SEARCH, user_id)
+                        # Check Wikipedia rate limit if enabled
+                        if user_config.enable_wikipedia:
+                            self.data_fetcher.rate_limiter.check_rate_limit(APIType.WIKIPEDIA, user_id)
+                        # Check Google rate limit if enabled
+                        if user_config.enable_google_search:
+                            self.data_fetcher.rate_limiter.check_rate_limit(APIType.GOOGLE_SEARCH, user_id)
+                        # Check Webometrics rate limit if enabled
+                        if user_config.enable_webometrics:
+                            self.data_fetcher.rate_limiter.check_rate_limit(APIType.WEBOMETRICS, user_id)
                     except RateLimitExceededException as e:
                         logger.warning(f"Rate limit hit for {university_name}: {e}")
                         result_df.at[idx, 'Rate Limited'] = 'Yes'
@@ -1445,15 +1589,20 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
                             'message': e.message
                         })
                     
-                    # Get ranking data
+                    # Get ranking data with user configuration
                     start_time = time.time()
-                    ranking_data = self.rank_university(university_name, country, user_id)
+                    ranking_data = self.rank_university(university_name, country, user_id, user_config)
                     processing_time = time.time() - start_time
                     
                     # Update result dataframe
                     result_df.at[idx, 'Global Score'] = ranking_data.composite
                     result_df.at[idx, 'Data Source'] = 'Real Data' if not ranking_data.is_estimated else 'Estimated'
                     result_df.at[idx, 'Processing Time (s)'] = round(processing_time, 2)
+                    result_df.at[idx, 'Rate Limited'] = 'Yes' if rate_limit_hit else 'No'
+                    
+                    # Track data sources used
+                    if hasattr(ranking_data, 'data_sources_used') and ranking_data.data_sources_used:
+                        result_df.at[idx, 'Data Sources Used'] = ', '.join(ranking_data.data_sources_used)
                     
                     # Update progress tracker
                     progress_tracker.update(1, rate_limit_hit)
@@ -1508,7 +1657,10 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
                     'Rate Limited Cases': [len(result_df[result_df['Rate Limited'] == 'Yes'])],
                     'Average Processing Time (s)': [result_df['Processing Time (s)'].mean()],
                     'Total Processing Time (s)': [result_df['Processing Time (s)'].sum()],
-                    'Rate Limits Hit': [progress_tracker.rate_limits_hit]
+                    'Rate Limits Hit': [progress_tracker.rate_limits_hit],
+                    'Wikipedia Enabled': [user_config.enable_wikipedia],
+                    'Google Search Enabled': [user_config.enable_google_search],
+                    'Webometrics Enabled': [user_config.enable_webometrics]
                 }
                 summary_df = pd.DataFrame(summary_data)
                 summary_df.to_excel(writer, sheet_name='Summary', index=False)
@@ -1524,7 +1676,8 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
                     'End Time': [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
                     'Total Time': [progress_tracker._format_time(time.time() - progress_tracker.start_time)],
                     'Items per Minute': [progress_tracker.processed_items / ((time.time() - progress_tracker.start_time) / 60) if (time.time() - progress_tracker.start_time) > 0 else 0],
-                    'Estimated Completion Accuracy': ['Based on last 10 items'] if len(progress_tracker.item_times) >= 10 else ['Based on all items']
+                    'Estimated Completion Accuracy': ['Based on last 10 items'] if len(progress_tracker.item_times) >= 10 else ['Based on all items'],
+                    'User Configuration': [json.dumps(user_config.to_dict(), indent=2)]
                 }
                 stats_df = pd.DataFrame(stats_data)
                 stats_df.to_excel(writer, sheet_name='Processing Stats', index=False)
@@ -1536,8 +1689,354 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
             logger.error(f"Error processing Excel file: {e}")
             raise
 
+class ExcelProcessingThread(threading.Thread):
+    """Thread for processing Excel files asynchronously"""
+    
+    def __init__(self, ranking_system, input_path: str, user_id: str, 
+                 chat_id: int, message_id: int, filename: str,
+                 user_config: Optional[UserConfiguration] = None):
+        super().__init__()
+        self.ranking_system = ranking_system
+        self.input_path = input_path
+        self.user_id = user_id
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.filename = filename
+        self.user_config = user_config or UserConfiguration(user_id)
+        self.output_path = None
+        self.rate_limit_issues = []
+        self.progress_queue = Queue()
+        self.cancelled = False
+        self.result_df = None
+        self.processed_count = 0
+        self.total_universities = 0
+        self.start_time = time.time()
+        self.last_update_time = time.time()
+        self.last_file_update_time = time.time()
+        
+    def run(self):
+        """Main thread execution"""
+        try:
+            # Read the Excel file
+            df = pd.read_excel(self.input_path)
+            self.total_universities = len(df)
+            
+            # Create a copy for results
+            self.result_df = df.copy()
+            
+            # Prepare new columns
+            self.result_df['Global Score'] = 0.0
+            self.result_df['Global Rank'] = 0
+            self.result_df['Country Rank'] = 0
+            self.result_df['Data Source'] = 'Estimated'
+            self.result_df['Rate Limited'] = 'No'
+            self.result_df['Processing Time (s)'] = 0.0
+            self.result_df['Error'] = ''
+            self.result_df['Data Sources Used'] = ''
+            
+            rate_limit_issues = []
+            
+            for idx, row in self.result_df.iterrows():
+                if self.cancelled:
+                    break
+                    
+                try:
+                    university_name = str(row.iloc[0])
+                    country = str(row.iloc[1]) if len(row) > 1 else ""
+                    
+                    # Check rate limits before processing (only for enabled sources)
+                    rate_limit_hit = False
+                    try:
+                        if self.user_config.enable_wikipedia:
+                            self.ranking_system.data_fetcher.rate_limiter.check_rate_limit(
+                                APIType.WIKIPEDIA, self.user_id
+                            )
+                        if self.user_config.enable_google_search:
+                            self.ranking_system.data_fetcher.rate_limiter.check_rate_limit(
+                                APIType.GOOGLE_SEARCH, self.user_id
+                            )
+                        if self.user_config.enable_webometrics:
+                            self.ranking_system.data_fetcher.rate_limiter.check_rate_limit(
+                                APIType.WEBOMETRICS, self.user_id
+                            )
+                    except RateLimitExceededException as e:
+                        rate_limit_hit = True
+                        rate_limit_issues.append({
+                            'university': university_name,
+                            'api': e.api_type.value,
+                            'reset_time': e.reset_time,
+                            'message': e.message
+                        })
+                    
+                    # Get ranking data with user configuration
+                    start_time = time.time()
+                    ranking_data = self.ranking_system.rank_university(
+                        university_name, country, self.user_id, self.user_config
+                    )
+                    processing_time = time.time() - start_time
+                    
+                    # Update result dataframe
+                    self.result_df.at[idx, 'Global Score'] = ranking_data.composite
+                    self.result_df.at[idx, 'Data Source'] = 'Real Data' if not ranking_data.is_estimated else 'Estimated'
+                    self.result_df.at[idx, 'Processing Time (s)'] = round(processing_time, 2)
+                    self.result_df.at[idx, 'Rate Limited'] = 'Yes' if rate_limit_hit else 'No'
+                    
+                    # Track data sources used
+                    if hasattr(ranking_data, 'data_sources_used') and ranking_data.data_sources_used:
+                        self.result_df.at[idx, 'Data Sources Used'] = ', '.join(ranking_data.data_sources_used)
+                    
+                    self.processed_count += 1
+                    
+                    # Send progress update every 10 universities or every 30 seconds
+                    current_time = time.time()
+                    if current_time - self.last_update_time >= 30 or idx % 10 == 0:
+                        progress_msg = self.get_progress_message()
+                        self.progress_queue.put(('progress', progress_msg))
+                        self.last_update_time = current_time
+                    
+                    # Send file update every 50 universities or every 2 minutes
+                    if (current_time - self.last_file_update_time >= 120 or 
+                        (self.processed_count > 0 and self.processed_count % 50 == 0)):
+                        if not self.cancelled:
+                            temp_file_path = self.create_temp_file()
+                            self.progress_queue.put(('file_update', temp_file_path))
+                            self.last_file_update_time = current_time
+                    
+                    # Add delay
+                    delay_time = 10 if rate_limit_hit else (5 if idx % 20 == 0 else 1)
+                    time.sleep(delay_time)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing row {idx}: {e}")
+                    self.result_df.at[idx, 'Data Source'] = 'Error'
+                    self.result_df.at[idx, 'Error'] = str(e)[:100]
+                    self.processed_count += 1
+                    continue
+            
+            # Final processing if not cancelled
+            if not self.cancelled and self.processed_count > 0:
+                self.finalize_processing(rate_limit_issues)
+            else:
+                # Partial results for cancelled processing
+                self.create_partial_results()
+            
+        except Exception as e:
+            logger.error(f"Error in Excel processing thread: {e}")
+            self.progress_queue.put(('error', str(e)))
+    
+    def get_progress_message(self) -> str:
+        """Get formatted progress message"""
+        elapsed = time.time() - self.start_time
+        elapsed_str = self.format_time(elapsed)
+        
+        if self.total_universities > 0:
+            percentage = (self.processed_count / self.total_universities) * 100
+            remaining = self.total_universities - self.processed_count
+            
+            # Estimate remaining time
+            if self.processed_count > 0:
+                avg_time = elapsed / self.processed_count
+                estimated_seconds = remaining * avg_time
+                remaining_str = self.format_time(estimated_seconds)
+            else:
+                remaining_str = "Calculating..."
+        else:
+            percentage = 0
+            remaining_str = "Unknown"
+        
+        # Add configuration info
+        config_info = []
+        if self.user_config.enable_wikipedia:
+            config_info.append("Wikipedia")
+        if self.user_config.enable_google_search:
+            config_info.append("Google")
+        if self.user_config.enable_webometrics:
+            config_info.append("Webometrics")
+        config_str = ", ".join(config_info) if config_info else "Wikipedia only"
+        
+        message = f"""
+📊 <b>Excel Processing Progress</b>
+
+✅ Processed: {self.processed_count}/{self.total_universities} ({percentage:.1f}%)
+⏱️ Elapsed: {elapsed_str}
+⏳ Estimated remaining: {remaining_str}
+
+⚙️ <b>Data Sources Enabled:</b> {config_str}
+
+🔄 <b>Status:</b> {'Running' if not self.cancelled else 'Cancelled'}
+
+<i>I'm sending updated Excel files every 2 minutes or 50 universities.</i>
+<i>Use /cancel_excel to stop processing and get current results.</i>
+        """
+        
+        return message
+    
+    def create_temp_file(self) -> str:
+        """Create a temporary Excel file with current progress"""
+        try:
+            # Create a copy of current results
+            temp_df = self.result_df.copy()
+            
+            # Sort by Global Score for ranking
+            temp_df = temp_df.sort_values(by='Global Score', ascending=False)
+            temp_df['Global Rank'] = range(1, len(temp_df) + 1)
+            
+            # Calculate country ranks if column exists
+            if 'Country' in temp_df.columns or len(temp_df.columns) > 1:
+                country_col = temp_df.columns[1] if len(temp_df.columns) > 1 else 'Country'
+                temp_df['Country Rank'] = temp_df.groupby(country_col)['Global Score'].rank(
+                    method='dense', ascending=False
+                ).astype(int)
+            
+            # Create temporary file
+            temp_path = tempfile.mktemp(suffix=f'_partial_{int(time.time())}.xlsx')
+            
+            with pd.ExcelWriter(temp_path, engine='openpyxl') as writer:
+                temp_df.to_excel(writer, sheet_name='Partial Results', index=False)
+                
+                percentage = (self.processed_count / self.total_universities) * 100
+                # Add progress summary
+                summary_data = {
+                    'Total Universities': [self.total_universities],
+                    'Processed So Far': [self.processed_count],
+                    'Remaining': [self.total_universities - self.processed_count],
+                    'Completion Percentage': [f"{percentage:.1f}%" if self.total_universities > 0 else "0%"],
+                    'Elapsed Time': [self.format_time(time.time() - self.start_time)],
+                    'Status': ['Running' if not self.cancelled else 'Cancelled'],
+                    'Data Sources Enabled': [json.dumps(self.user_config.to_dict(), indent=2)]
+                }
+                summary_df = pd.DataFrame(summary_data)
+                summary_df.to_excel(writer, sheet_name='Progress Summary', index=False)
+            
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Error creating temp file: {e}")
+            return None
+    
+    def finalize_processing(self, rate_limit_issues):
+        """Finalize processing and create final output file"""
+        try:
+            # Sort by Global Score for ranking
+            self.result_df = self.result_df.sort_values(by='Global Score', ascending=False)
+            self.result_df['Global Rank'] = range(1, len(self.result_df) + 1)
+            
+            # Calculate country ranks
+            if 'Country' in self.result_df.columns or len(self.result_df.columns) > 1:
+                country_col = self.result_df.columns[1] if len(self.result_df.columns) > 1 else 'Country'
+                self.result_df['Country Rank'] = self.result_df.groupby(country_col)['Global Score'].rank(
+                    method='dense', ascending=False
+                ).astype(int)
+            
+            # Create output file
+            self.output_path = tempfile.mktemp(suffix='_ranked.xlsx')
+            
+            with pd.ExcelWriter(self.output_path, engine='openpyxl') as writer:
+                # Main rankings sheet
+                self.result_df.to_excel(writer, sheet_name='Rankings', index=False)
+                
+                # Summary sheet
+                summary_data = {
+                    'Total Universities': [self.total_universities],
+                    'Processed Successfully': [self.processed_count],
+                    'Errors': [self.total_universities - self.processed_count],
+                    'Real Data Used': [len(self.result_df[self.result_df['Data Source'] == 'Real Data'])],
+                    'Estimated Data Used': [len(self.result_df[self.result_df['Data Source'] == 'Estimated'])],
+                    'Rate Limited Cases': [len(self.result_df[self.result_df['Rate Limited'] == 'Yes'])],
+                    'Average Processing Time (s)': [self.result_df['Processing Time (s)'].mean()],
+                    'Total Processing Time (s)': [self.result_df['Processing Time (s)'].sum()],
+                    'Total Processing Time (formatted)': [self.format_time(time.time() - self.start_time)],
+                    'Wikipedia Enabled': [self.user_config.enable_wikipedia],
+                    'Google Search Enabled': [self.user_config.enable_google_search],
+                    'Webometrics Enabled': [self.user_config.enable_webometrics]
+                }
+                summary_df = pd.DataFrame(summary_data)
+                summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Rate limit issues sheet (if any)
+                if rate_limit_issues:
+                    issues_df = pd.DataFrame(rate_limit_issues)
+                    issues_df.to_excel(writer, sheet_name='Rate Limit Issues', index=False)
+                
+                # User configuration sheet
+                config_data = {
+                    'User ID': [self.user_id],
+                    'Wikipedia Enabled': [self.user_config.enable_wikipedia],
+                    'Google Search Enabled': [self.user_config.enable_google_search],
+                    'Webometrics Enabled': [self.user_config.enable_webometrics],
+                    'Configuration Timestamp': [self.user_config.timestamp.isoformat()]
+                }
+                config_df = pd.DataFrame(config_data)
+                config_df.to_excel(writer, sheet_name='User Configuration', index=False)
+            
+            self.progress_queue.put(('complete', self.output_path))
+            
+        except Exception as e:
+            logger.error(f"Error finalizing processing: {e}")
+            self.progress_queue.put(('error', str(e)))
+    
+    def create_partial_results(self):
+        """Create partial results file for cancelled processing"""
+        try:
+            self.output_path = tempfile.mktemp(suffix='_partial_results.xlsx')
+            
+            with pd.ExcelWriter(self.output_path, engine='openpyxl') as writer:
+                # Only include processed rows
+                processed_df = self.result_df.head(self.processed_count).copy()
+                if len(processed_df) > 0:
+                    processed_df = processed_df.sort_values(by='Global Score', ascending=False)
+                    processed_df['Global Rank'] = range(1, len(processed_df) + 1)
+                    
+                    # Calculate country ranks
+                    if 'Country' in processed_df.columns or len(processed_df.columns) > 1:
+                        country_col = processed_df.columns[1] if len(processed_df.columns) > 1 else 'Country'
+                        processed_df['Country Rank'] = processed_df.groupby(country_col)['Global Score'].rank(
+                            method='dense', ascending=False
+                        ).astype(int)
+                    
+                    processed_df.to_excel(writer, sheet_name='Partial Results', index=False)
+                
+                # Summary sheet
+                summary_data = {
+                    'Total Universities': [self.total_universities],
+                    'Successfully Processed': [self.processed_count],
+                    'Remaining Universities': [self.total_universities - self.processed_count],
+                    'Completion Percentage': [f"{(self.processed_count/self.total_universities*100):.1f}%" if self.total_universities > 0 else "0%"],
+                    'Processing Time': [self.format_time(time.time() - self.start_time)],
+                    'Status': ['Cancelled by User'],
+                    'Wikipedia Enabled': [self.user_config.enable_wikipedia],
+                    'Google Search Enabled': [self.user_config.enable_google_search],
+                    'Webometrics Enabled': [self.user_config.enable_webometrics]
+                }
+                summary_df = pd.DataFrame(summary_data)
+                summary_df.to_excel(writer, sheet_name='Progress Summary', index=False)
+            
+            self.progress_queue.put(('cancelled', self.output_path))
+            
+        except Exception as e:
+            logger.error(f"Error creating partial results: {e}")
+            self.progress_queue.put(('error', str(e)))
+    
+    def format_time(self, seconds: float) -> str:
+        """Format seconds into readable time"""
+        if seconds < 60:
+            return f"{int(seconds)} seconds"
+        elif seconds < 3600:
+            minutes = int(seconds / 60)
+            seconds = int(seconds % 60)
+            return f"{minutes}m {seconds}s"
+        else:
+            hours = int(seconds / 3600)
+            minutes = int((seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+    
+    def cancel(self):
+        """Cancel the processing"""
+        self.cancelled = True
+        logger.info(f"Cancelled processing for user {self.user_id}")
+
 # ============================================================================
-# ENHANCED BOT WITH RATE LIMITING
+# ENHANCED BOT WITH RATE LIMITING AND USER CONFIGURATION
 # ============================================================================
 
 class EnhancedUniRankBot:
@@ -1553,12 +2052,29 @@ class EnhancedUniRankBot:
         # Store current ranking data for rationale viewing
         self.user_ranking_data = {}
         
-        # Track user Excel processing
+        # Store user configurations
+        self.user_configurations = {}
+        
+        # Track user Excel processing with thread information
         self.user_excel_processing = {}
         
         # Set up handlers
         self.setup_handlers()
         logger.info("EnhancedUniRankBot initialized")
+    
+    def get_user_config(self, user_id: str) -> UserConfiguration:
+        """Get or create user configuration"""
+        if user_id not in self.user_configurations:
+            self.user_configurations[user_id] = UserConfiguration(user_id)
+            logger.info(f"Created new configuration for user {user_id}")
+        return self.user_configurations[user_id]
+    
+    def update_user_config(self, user_id: str, source: str, enabled: bool) -> UserConfiguration:
+        """Update user configuration for a specific source"""
+        config = self.get_user_config(user_id)
+        config.update_source(source, enabled)
+        logger.info(f"Updated configuration for user {user_id}: {source} = {enabled}")
+        return config
     
     def setup_handlers(self):
         """Setup all bot handlers"""
@@ -1572,6 +2088,9 @@ class EnhancedUniRankBot:
         self.dispatcher.add_handler(CommandHandler("parameters", self.parameters_command))
         self.dispatcher.add_handler(CommandHandler("rank_excel", self.rank_excel_command))
         self.dispatcher.add_handler(CommandHandler("rate_status", self.rate_status_command))
+        self.dispatcher.add_handler(CommandHandler("cancel_excel", self.cancel_excel_command))
+        self.dispatcher.add_handler(CommandHandler("config", self.config_command))  # New config command
+        self.dispatcher.add_handler(CommandHandler("config_status", self.config_status_command))  # Config status command
         
         # Conversation handler for interactive ranking
         conv_handler = ConversationHandler(
@@ -1602,6 +2121,78 @@ class EnhancedUniRankBot:
         
         logger.info("Bot handlers setup complete")
     
+    def start_periodic_updates(self):
+        """Start periodic update checking for all active Excel processing"""
+        def check_updates():
+            while True:
+                try:
+                    for user_id, processing_info in list(self.user_excel_processing.items()):
+                        if 'thread' in processing_info:
+                            thread = processing_info['thread']
+                            
+                            # Check for progress updates
+                            while not thread.progress_queue.empty():
+                                update_type, data = thread.progress_queue.get()
+                                
+                                if update_type == 'progress':
+                                    # Update progress message
+                                    context = processing_info.get('context')
+                                    if context and 'bot' in processing_info:
+                                        try:
+                                            processing_info['bot'].edit_message_text(
+                                                chat_id=processing_info['chat_id'],
+                                                message_id=processing_info['message_id'],
+                                                text=data,
+                                                parse_mode=ParseMode.HTML
+                                            )
+                                        except Exception as e:
+                                            logger.error(f"Error updating progress: {e}")
+                                    
+                                elif update_type == 'file_update':
+                                    # Send updated Excel file
+                                    if data and os.path.exists(data):
+                                        context = processing_info.get('context')
+                                        if context and 'bot' in processing_info:
+                                            try:
+                                                with open(data, 'rb') as f:
+                                                    processing_info['bot'].send_document(
+                                                        chat_id=processing_info['chat_id'],
+                                                        document=f,
+                                                        filename=f"progress_update_{os.path.basename(data)}",
+                                                        caption="🔄 <b>Progress Update:</b> Current processing results",
+                                                        parse_mode=ParseMode.HTML
+                                                    )
+                                                # Clean up temp file
+                                                os.unlink(data)
+                                            except Exception as e:
+                                                logger.error(f"Error sending file update: {e}")
+                                    
+                                elif update_type == 'complete':
+                                    # Processing complete
+                                    self.finalize_excel_processing(user_id, data, 'complete')
+                                    break
+                                    
+                                elif update_type == 'cancelled':
+                                    # Processing cancelled
+                                    self.finalize_excel_processing(user_id, data, 'cancelled')
+                                    break
+                                    
+                                elif update_type == 'error':
+                                    # Error occurred
+                                    self.handle_processing_error(user_id, data)
+                                    break
+                    
+                    # Sleep before next check
+                    time.sleep(5)
+                    
+                except Exception as e:
+                    logger.error(f"Error in periodic update checker: {e}")
+                    time.sleep(10)
+        
+        # Start the update checker in a separate thread
+        update_thread = threading.Thread(target=check_updates, daemon=True)
+        update_thread.start()
+        
     def error_handler(self, update: Update, context: CallbackContext):
         """Handle errors"""
         logger.error(f"Update {update} caused error {context.error}")
@@ -1652,6 +2243,7 @@ class EnhancedUniRankBot:
         print("🤖 pkUniRankBot is starting...")
         print("📊 University Ranking System Ready")
         print("📈 Excel Processing Enabled")
+        print("⚙️ User configuration system enabled")
         print("⚠️  Rate limiting active for all APIs")
         print("📊 Detailed logging enabled")
         print("⚡ Bot is running. Press Ctrl+C to stop.")
@@ -1664,16 +2256,24 @@ class EnhancedUniRankBot:
         """Handle /start command"""
         logger.info(f"Start command from user: {update.effective_user.id}")
         user = update.message.from_user
+        
+        # Get user configuration
+        user_config = self.get_user_config(str(user.id))
+        
         welcome_text = f"""
 🎓 Welcome to <b>pkUniRankBot</b> {user.first_name}!
 
 I analyze universities worldwide using a comprehensive multi-parameter ranking system.
 
-<b>⚠️ IMPORTANT RATE LIMIT INFORMATION:</b>
-• Wikipedia: 100 requests/minute, 2000/hour
-• Google Search: 10 requests/minute, 100/hour  
-• Webometrics: 30 requests/minute, 500/hour
-• All APIs: Daily limits enforced
+<b>⚙️ CURRENT CONFIGURATION:</b>
+• Wikipedia: {'✅ Enabled' if user_config.enable_wikipedia else '❌ Disabled'}
+• Google Search: {'✅ Enabled' if user_config.enable_google_search else '❌ Disabled'}
+• Webometrics: {'✅ Enabled' if user_config.enable_webometrics else '❌ Disabled'}
+
+<b>⚠️ IMPORTANT:</b>
+• By default, only Wikipedia is enabled
+• Google and Webometrics are disabled to avoid rate limits
+• Use /config to change your settings
 
 <b>When rate limits are hit:</b>
 1. You'll receive a clear message
@@ -1683,6 +2283,8 @@ I analyze universities worldwide using a comprehensive multi-parameter ranking s
 <b>Available Commands:</b>
 /rank - Rank a single university
 /rank_excel - Process Excel file with multiple universities
+/config - Configure data sources (enable/disable Google, Webometrics)
+/config_status - Check current configuration
 /tiers - View tier explanations  
 /parameters - View ranking parameters
 /help - Get help
@@ -1692,6 +2294,7 @@ I analyze universities worldwide using a comprehensive multi-parameter ranking s
         keyboard = [
             [InlineKeyboardButton("🎯 Rank a University", callback_data="start_ranking")],
             [InlineKeyboardButton("📊 Process Excel File", callback_data="rank_excel")],
+            [InlineKeyboardButton("⚙️ Configure Data Sources", callback_data="config_menu")],
             [InlineKeyboardButton("📈 Check Rate Limits", callback_data="rate_status")],
             [InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers")],
             [InlineKeyboardButton("📊 View Parameters", callback_data="view_parameters")]
@@ -1700,6 +2303,108 @@ I analyze universities worldwide using a comprehensive multi-parameter ranking s
         
         update.message.reply_text(
             welcome_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
+    
+    def config_command(self, update: Update, context: CallbackContext):
+        """Handle /config command to configure data sources"""
+        user_id = str(update.effective_user.id)
+        logger.info(f"Config command from user: {user_id}")
+        
+        # Get current configuration
+        user_config = self.get_user_config(user_id)
+        
+        config_text = f"""
+⚙️ <b>Data Source Configuration</b>
+
+Configure which data sources I should use for university rankings:
+
+<b>Current Settings:</b>
+1. Wikipedia: {'✅ Enabled' if user_config.enable_wikipedia else '❌ Disabled'}
+2. Google Search: {'✅ Enabled' if user_config.enable_google_search else '❌ Disabled'}
+3. Webometrics: {'✅ Enabled' if user_config.enable_webometrics else '❌ Disabled'}
+
+<b>Recommendations:</b>
+• Wikipedia: Always enabled (reliable, free, good rate limits)
+• Google Search: Enable for more accurate rankings (strict rate limits)
+• Webometrics: Enable for specialized ranking data (moderate rate limits)
+
+<b>⚠️ Rate Limit Warnings:</b>
+• Google: 10 requests/minute, 100/hour (very strict!)
+• Webometrics: 30 requests/minute, 500/hour
+• Wikipedia: 100 requests/minute, 2000/hour (generous)
+
+Use the buttons below to toggle each data source:
+        """
+        
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"{'✅ Wikipedia' if user_config.enable_wikipedia else '❌ Wikipedia'}",
+                    callback_data=f"toggle_wikipedia_{'disable' if user_config.enable_wikipedia else 'enable'}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'✅ Google Search' if user_config.enable_google_search else '❌ Google Search'}",
+                    callback_data=f"toggle_google_{'disable' if user_config.enable_google_search else 'enable'}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'✅ Webometrics' if user_config.enable_webometrics else '❌ Webometrics'}",
+                    callback_data=f"toggle_webometrics_{'disable' if user_config.enable_webometrics else 'enable'}"
+                )
+            ],
+            [
+                InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu"),
+                InlineKeyboardButton("📊 Check Rate Limits", callback_data="rate_status")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        update.message.reply_text(
+            config_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
+    
+    def config_status_command(self, update: Update, context: CallbackContext):
+        """Handle /config_status command to show current configuration"""
+        user_id = str(update.effective_user.id)
+        logger.info(f"Config_status command from user: {user_id}")
+        
+        # Get current configuration
+        user_config = self.get_user_config(user_id)
+        
+        status_text = f"""
+⚙️ <b>Your Current Configuration</b>
+
+<b>Data Sources:</b>
+1. Wikipedia: {'✅ Enabled' if user_config.enable_wikipedia else '❌ Disabled'}
+2. Google Search: {'✅ Enabled' if user_config.enable_google_search else '❌ Disabled'}
+3. Webometrics: {'✅ Enabled' if user_config.enable_webometrics else '❌ Disabled'}
+
+<b>Last Updated:</b> {user_config.timestamp.strftime("%Y-%m-%d %H:%M:%S")}
+
+<b>Effects on Ranking:</b>
+• With Wikipedia only: Basic ranking, fast processing
+• With Google enabled: More accurate rankings, slower due to rate limits
+• With Webometrics enabled: Specialized ranking data, moderate speed
+
+<b>To change settings:</b> Use /config or click Configure Data Sources below.
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("⚙️ Configure Data Sources", callback_data="config_menu")],
+            [InlineKeyboardButton("📊 Check Rate Limits", callback_data="rate_status")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        update.message.reply_text(
+            status_text,
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup
         )
@@ -1719,6 +2424,12 @@ This bot uses a multi-parameter scoring system:
 • Transparency & Recognition (10%)
 • Visibility & Presence (5%)
 
+<b>Data Sources:</b>
+You can configure which data sources to use:
+• Wikipedia (enabled by default)
+• Google Search (disabled by default due to rate limits)
+• Webometrics (disabled by default)
+
 <b>Tier System:</b>
 A+ (85-100): World-class
 A (75-84): Excellent
@@ -1731,6 +2442,8 @@ D (0-44): Poor
 /start - Start the bot
 /rank - Rank a single university
 /rank_excel - Process Excel file with universities
+/config - Configure data sources
+/config_status - Check current configuration
 /tiers - View tier details
 /parameters - View parameter details
 /rate_status - Check API rate limits
@@ -1807,23 +2520,38 @@ Institutional web presence, brand recognition.
     
     def rank_excel_command(self, update: Update, context: CallbackContext):
         """Handle /rank_excel command with warnings for large files"""
-        logger.info(f"Rank_excel command from user: {update.effective_user.id}")
-        instructions = """
+        user_id = str(update.effective_user.id)
+        logger.info(f"Rank_excel command from user: {user_id}")
+        
+        # Get user configuration
+        user_config = self.get_user_config(user_id)
+        
+        # Check if Google is enabled and warn about rate limits
+        warning = ""
+        if user_config.enable_google_search:
+            warning = """
+<b>⚠️ GOOGLE SEARCH ENABLED WARNING:</b>
+• Google has strict rate limits (10 requests/minute)
+• Large Excel files will hit these limits quickly
+• Consider disabling Google search for large files
+• Use /config to adjust settings
+            """
+        
+        instructions = f"""
 <b>📊 Excel Ranking Instructions</b>
 
-Please send me an Excel file (.xlsx or .xls) with university data.
+{warning}
 
-<b>⚠️ IMPORTANT FOR LARGE FILES:</b>
-• 700+ universities will take approximately 30-60 minutes
-• I'll send progress updates every 30 seconds
-• Rate limits are strictly enforced to avoid API blocks
-• Large files will use more estimated data
+<b>⚙️ YOUR CURRENT CONFIGURATION:</b>
+• Wikipedia: {'✅ Enabled' if user_config.enable_wikipedia else '❌ Disabled'}
+• Google Search: {'✅ Enabled' if user_config.enable_google_search else '❌ Disabled'}
+• Webometrics: {'✅ Enabled' if user_config.enable_webometrics else '❌ Disabled'}
 
-<b>📈 TIME ESTIMATES:</b>
-• 100 universities: ~5-10 minutes
-• 300 universities: ~15-30 minutes  
-• 500 universities: ~25-50 minutes
-• 700+ universities: ~35-70 minutes
+<b>📈 TIME ESTIMATES (with current config):</b>
+• 100 universities: ~5-15 minutes
+• 300 universities: ~15-45 minutes  
+• 500 universities: ~25-75 minutes
+• 700+ universities: ~35-105 minutes
 
 <b>Required Columns:</b>
 - University/Institution names (first column)
@@ -1839,12 +2567,80 @@ Please send me an Excel file (.xlsx or .xls) with university data.
 - Data Source (Real Data/Estimated)
 - Rate Limit Status
 - Processing Time
+- Data Sources Used
 
 <b>Just send me your Excel file now!</b>
+<i>Use /config to change data sources before processing large files.</i>
         """
         
         update.message.reply_text(instructions, parse_mode=ParseMode.HTML)
     
+    def cancel_excel_command(self, update: Update, context: CallbackContext):
+        """Cancel Excel processing for current user"""
+        user_id = str(update.effective_user.id)
+        
+        if user_id not in self.user_excel_processing:
+            update.message.reply_text(
+                "❌ <b>No active Excel processing found.</b>\n\n"
+                "You don't have any Excel files being processed right now.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Cancel the processing thread
+        processing_info = self.user_excel_processing[user_id]
+        if 'thread' in processing_info:
+            processing_info['thread'].cancel()
+            processing_info['status'] = 'cancelling'
+        
+        update.message.reply_text(
+            "🛑 <b>Cancelling Excel processing...</b>\n\n"
+            "I'll send you the partial results once cancellation is complete.",
+            parse_mode=ParseMode.HTML
+        )
+
+    def finalize_excel_processing(self, user_id: str, output_path: str, status: str):
+        """Finalize Excel processing and send final file"""
+        try:
+            if user_id not in self.user_excel_processing:
+                return
+            
+            processing_info = self.user_excel_processing[user_id]
+            
+            # Send final file
+            if output_path and os.path.exists(output_path):
+                caption = "✅ <b>Excel Processing Complete!</b>" if status == 'complete' else "🛑 <b>Excel Processing Cancelled!</b>"
+                caption += "\n\n<i>Here are your results:</i>"
+                
+                with open(output_path, 'rb') as result_file:
+                    processing_info['bot'].send_document(
+                        chat_id=processing_info['chat_id'],
+                        document=result_file,
+                        filename=f"results_{os.path.basename(output_path)}",
+                        caption=caption,
+                        parse_mode=ParseMode.HTML
+                    )
+            
+            # Clean up
+            self._cleanup_processing(user_id)
+            
+        except Exception as e:
+            logger.error(f"Error finalizing Excel processing: {e}")
+
+    def handle_processing_error(self, user_id: str, error_message: str):
+        """Handle processing errors"""
+        try:
+            if user_id in self.user_excel_processing:
+                processing_info = self.user_excel_processing[user_id]
+                processing_info['bot'].send_message(
+                    chat_id=processing_info['chat_id'],
+                    text=f"❌ <b>Excel Processing Error</b>\n\n{error_message[:500]}",
+                    parse_mode=ParseMode.HTML
+                )
+                self._cleanup_processing(user_id)
+        except Exception as e:
+            logger.error(f"Error handling processing error: {e}")
+            
     def rate_status_command(self, update: Update, context: CallbackContext):
         """Check current API rate limit status"""
         # Handle both message updates and callback queries
@@ -2012,17 +2808,23 @@ Please send me an Excel file (.xlsx or .xls) with university data.
     def perform_ranking(self, update: Update, university_name: str, country: str, context: CallbackContext):
         """Perform ranking and send results"""
         user_id = update.effective_user.id
+        user_id_str = str(user_id)
         logger.info(f"Performing ranking for user {user_id}: {university_name}, {country}")
         
+        # Get user configuration
+        user_config = self.get_user_config(user_id_str)
+        
         processing_msg = update.message.reply_text(
-            f"🔍 <b>Analyzing {university_name}...</b>\n\nPlease wait while I gather data...",
+            f"🔍 <b>Analyzing {university_name}...</b>\n\n"
+            f"⚙️ Using: {', '.join(user_config.get_enabled_sources()) if user_config.get_enabled_sources() else 'Wikipedia only'}\n"
+            "Please wait while I gather data...",
             parse_mode=ParseMode.HTML
         )
         
         try:
             logger.info(f"Starting ranking process for {university_name}")
-            # Get ranking data
-            ranking_data = self.ranking_system.rank_university(university_name, country, str(user_id))
+            # Get ranking data with user configuration
+            ranking_data = self.ranking_system.rank_university(university_name, country, user_id_str, user_config)
             logger.info(f"Ranking data obtained for {university_name}")
             
             # Store ranking data for rationale viewing
@@ -2030,7 +2832,7 @@ Please send me an Excel file (.xlsx or .xls) with university data.
             logger.debug(f"Stored ranking data for user {user_id}")
             
             # Format results
-            results_text = self.format_ranking_results(ranking_data)
+            results_text = self.format_ranking_results(ranking_data, user_config)
             logger.info(f"Formatted results for {university_name}")
             
             # Send results
@@ -2056,8 +2858,8 @@ Using estimated data for this ranking.
             # Try to get estimated ranking anyway
             try:
                 logger.info(f"Attempting estimated ranking for {university_name} after rate limit")
-                ranking_data = self.ranking_system.rank_university(university_name, country, str(user_id))
-                results_text = self.format_ranking_results(ranking_data)
+                ranking_data = self.ranking_system.rank_university(university_name, country, user_id_str, user_config)
+                results_text = self.format_ranking_results(ranking_data, user_config)
                 full_text = error_text + "\n\n" + results_text
                 
                 processing_msg.edit_text(
@@ -2084,7 +2886,7 @@ Using estimated data for this ranking.
             )
     
     def handle_excel_file(self, update: Update, context: CallbackContext):
-        """Enhanced Excel file handling with progress updates"""
+        """Enhanced Excel file handling with asynchronous processing"""
         user_id = str(update.effective_user.id)
         logger.info(f"Excel file received from user {user_id}")
         
@@ -2094,7 +2896,7 @@ Using estimated data for this ranking.
                 logger.warning(f"User {user_id} already has a file being processed")
                 update.message.reply_text(
                     "⏳ <b>You already have a file being processed.</b>\n\n"
-                    "Please wait for the current processing to complete.",
+                    "Please wait for the current processing to complete or use /cancel_excel to cancel it.",
                     parse_mode=ParseMode.HTML
                 )
                 return
@@ -2103,30 +2905,41 @@ Using estimated data for this ranking.
             document = update.message.document
             logger.info(f"Document info: {document.file_name}, {document.file_size} bytes")
             
-            # Send initial processing message
-            processing_msg = update.message.reply_text(
-                "📥 <b>File Received!</b>\n\n"
-                "🔍 Starting to fetch real data from internet sources...\n"
-                "⏳ This may take several minutes for large files.\n\n"
-                "<b>Rate Limits Being Respected:</b>\n"
-                "• Wikipedia: 100/min, 2000/hour\n"
-                "• Google Search: 10/min, 100/hour\n"
-                "• Webometrics: 30/min, 500/hour\n\n"
-                "<i>If rate limits are hit, I'll use estimated data and show you the details.</i>",
-                parse_mode=ParseMode.HTML
-            )
+            # Get user configuration
+            user_config = self.get_user_config(user_id)
             
-            # Mark user as processing
-            self.user_excel_processing[user_id] = {
-                'message_id': processing_msg.message_id,
-                'start_time': datetime.now(),
-                'last_update': datetime.now()
-            }
-            logger.info(f"Marked user {user_id} as processing")
+            # Send initial processing message with cancel button
+            keyboard = [[
+                InlineKeyboardButton("❌ Cancel Processing", callback_data=f"cancel_excel_{user_id}")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Show configuration info
+            config_info = []
+            if user_config.enable_wikipedia:
+                config_info.append("Wikipedia")
+            if user_config.enable_google_search:
+                config_info.append("Google")
+            if user_config.enable_webometrics:
+                config_info.append("Webometrics")
+            config_str = ", ".join(config_info) if config_info else "Wikipedia only"
+            
+            processing_msg = update.message.reply_text(
+                f"📥 <b>File Received!</b>\n\n"
+                f"⚙️ <b>Data Sources:</b> {config_str}\n"
+                "🔍 Starting asynchronous processing...\n"
+                "⏳ You can continue using other bot commands while processing.\n\n"
+                "<b>I will:</b>\n"
+                "• Send progress updates every 30 seconds\n"
+                "• Send updated Excel files every 2 minutes\n"
+                "• Allow you to cancel anytime with /cancel_excel\n\n"
+                "<i>Processing started. The bot remains responsive to other commands!</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup
+            )
             
             # Download the file
             file = context.bot.get_file(document.file_id)
-            logger.debug(f"Starting file download")
             
             # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
@@ -2134,69 +2947,56 @@ Using estimated data for this ranking.
                 input_path = tmp_file.name
             logger.info(f"File downloaded to {input_path}")
             
-            # Define progress callback function
-            def send_progress_update(progress_message: str):
-                """Send progress update to user"""
-                try:
-                    # Only update every 30 seconds to avoid spamming
-                    now = datetime.now()
-                    last_update = self.user_excel_processing.get(user_id, {}).get('last_update')
-                    
-                    if last_update and (now - last_update).total_seconds() >= 30:
-                        processing_msg.edit_text(
-                            progress_message,
-                            parse_mode=ParseMode.HTML
-                        )
-                        self.user_excel_processing[user_id]['last_update'] = now
-                        logger.debug(f"Sent progress update to user {user_id}")
-                except Exception as e:
-                    logger.error(f"Error sending progress update: {e}")
+            # Start processing thread with user configuration
+            thread = ExcelProcessingThread(
+                ranking_system=self.ranking_system,
+                input_path=input_path,
+                user_id=user_id,
+                chat_id=update.effective_chat.id,
+                message_id=processing_msg.message_id,
+                filename=document.file_name,
+                user_config=user_config
+            )
             
-            # Process the Excel file with progress updates
-            logger.info(f"Starting Excel processing for user {user_id}")
+            # Store processing info
+            self.user_excel_processing[user_id] = {
+                'thread': thread,
+                'context': context,
+                'bot': context.bot,
+                'chat_id': update.effective_chat.id,
+                'message_id': processing_msg.message_id,
+                'input_path': input_path,
+                'start_time': datetime.now(),
+                'status': 'running',
+                'user_config': user_config
+            }
             
-            try:
-                output_path, rate_limit_issues = self.ranking_system.process_excel_file(
-                    input_path, 
-                    user_id,
-                    progress_callback=send_progress_update
-                )
-                
-                logger.info(f"Excel processing complete. Output: {output_path}, Rate limit issues: {len(rate_limit_issues)}")
-                
-                # Prepare final message with detailed statistics
-                final_message = self._create_final_summary_message(rate_limit_issues, output_path)
-                
-                # Send the file
-                with open(output_path, 'rb') as result_file:
-                    logger.info(f"Sending result file to user {user_id}")
-                    context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=result_file,
-                        filename=f"ranked_{document.file_name}",
-                        caption=final_message,
-                        parse_mode=ParseMode.HTML
-                    )
-                logger.info(f"Result file sent successfully to user {user_id}")
-                
-            except Exception as e:
-                logger.error(f"Error during Excel processing: {e}")
-                processing_msg.edit_text(
-                    f"❌ <b>Error Processing File</b>\n\n{str(e)[:500]}",
-                    parse_mode=ParseMode.HTML
-                )
+            # Start the thread
+            thread.start()
             
-            # Clean up temporary files and user tracking
-            self._cleanup_processing(user_id, input_path, output_path if 'output_path' in locals() else None)
+            # Start periodic updates if not already running
+            if not hasattr(self, 'update_checker_started'):
+                self.start_periodic_updates()
+                self.update_checker_started = True
             
-        except RateLimitExceededException as e:
-            self._handle_rate_limit_exception(update, user_id, e)
+            logger.info(f"Started Excel processing thread for user {user_id} with config: {user_config.to_dict()}")
+            
         except Exception as e:
-            self._handle_general_exception(update, user_id, e)
+            logger.error(f"Error starting Excel processing: {e}")
+            update.message.reply_text(
+                f"❌ <b>Error Starting Processing</b>\n\n{str(e)[:500]}",
+                parse_mode=ParseMode.HTML
+            )
     
-    def _create_final_summary_message(self, rate_limit_issues: List[Dict], output_path: str) -> str:
+    def _create_final_summary_message(self, rate_limit_issues: List[Dict], output_path: str, user_config: UserConfiguration) -> str:
         """Create final summary message"""
         final_message = "🎯 <b>Enhanced University Rankings - Complete!</b>\n\n"
+        
+        # Add configuration info
+        final_message += "<b>⚙️ CONFIGURATION USED:</b>\n"
+        final_message += f"• Wikipedia: {'✅ Enabled' if user_config.enable_wikipedia else '❌ Disabled'}\n"
+        final_message += f"• Google Search: {'✅ Enabled' if user_config.enable_google_search else '❌ Disabled'}\n"
+        final_message += f"• Webometrics: {'✅ Enabled' if user_config.enable_webometrics else '❌ Disabled'}\n\n"
         
         if rate_limit_issues:
             # Group rate limit issues by API
@@ -2227,6 +3027,7 @@ Using estimated data for this ranking.
         final_message += "• Rankings: Main results with scores and ranks\n"
         final_message += "• Summary: Processing statistics and metrics\n"
         final_message += "• Processing Stats: Timing and performance data\n"
+        final_message += "• User Configuration: Your data source settings\n"
         if rate_limit_issues:
             final_message += "• Rate Limit Issues: Detailed API limit information\n"
         
@@ -2234,15 +3035,19 @@ Using estimated data for this ranking.
         
         return final_message
     
-    def _cleanup_processing(self, user_id: str, input_path: str, output_path: Optional[str] = None):
+    def _cleanup_processing(self, user_id: str):
         """Clean up processing resources"""
         try:
-            if os.path.exists(input_path):
-                os.unlink(input_path)
-            if output_path and os.path.exists(output_path):
-                os.unlink(output_path)
             if user_id in self.user_excel_processing:
+                processing_info = self.user_excel_processing[user_id]
+                
+                # Clean up input file
+                if 'input_path' in processing_info and os.path.exists(processing_info['input_path']):
+                    os.unlink(processing_info['input_path'])
+                
+                # Remove from processing dict
                 del self.user_excel_processing[user_id]
+                
             logger.info(f"Cleanup completed for user {user_id}")
         except Exception as e:
             logger.error(f"Cleanup error for user {user_id}: {e}")
@@ -2261,7 +3066,7 @@ Please try again after the reset time, or split your Excel file into smaller bat
 """
         
         update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-        self._cleanup_processing(user_id, None, None)
+        self._cleanup_processing(user_id)
     
     def _handle_general_exception(self, update: Update, user_id: str, e: Exception):
         """Handle general exceptions"""
@@ -2278,7 +3083,7 @@ Please ensure your Excel file has the correct format:
 """
         
         update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-        self._cleanup_processing(user_id, None, None)
+        self._cleanup_processing(user_id)
     
     def rate_status_callback(self, query, context: CallbackContext):
         """Check current API rate limit status for callback queries"""
@@ -2343,41 +3148,57 @@ Please ensure your Excel file has the correct format:
     def rank_excel_callback(self, query, context: CallbackContext):
         """Handle rank_excel command for callback queries"""
         user_id = query.from_user.id
+        user_id_str = str(user_id)
         logger.info(f"Rank_excel callback from user: {user_id}")
         
-        instructions = """
-    <b>📊 Excel Ranking Instructions</b>
+        # Get user configuration
+        user_config = self.get_user_config(user_id_str)
+        
+        # Check if Google is enabled and warn about rate limits
+        warning = ""
+        if user_config.enable_google_search:
+            warning = """
+<b>⚠️ GOOGLE SEARCH ENABLED WARNING:</b>
+• Google has strict rate limits (10 requests/minute)
+• Large Excel files will hit these limits quickly
+• Consider disabling Google search for large files
+• Use /config to adjust settings
+            """
+        
+        instructions = f"""
+<b>📊 Excel Ranking Instructions</b>
 
-    Please send me an Excel file (.xlsx or .xls) with university data.
+{warning}
 
-    <b>⚠️ IMPORTANT FOR LARGE FILES:</b>
-    • 700+ universities will take approximately 30-60 minutes
-    • I'll send progress updates every 30 seconds
-    • Rate limits are strictly enforced to avoid API blocks
-    • Large files will use more estimated data
+<b>⚙️ YOUR CURRENT CONFIGURATION:</b>
+• Wikipedia: {'✅ Enabled' if user_config.enable_wikipedia else '❌ Disabled'}
+• Google Search: {'✅ Enabled' if user_config.enable_google_search else '❌ Disabled'}
+• Webometrics: {'✅ Enabled' if user_config.enable_webometrics else '❌ Disabled'}
 
-    <b>📈 TIME ESTIMATES:</b>
-    • 100 universities: ~5-10 minutes
-    • 300 universities: ~15-30 minutes  
-    • 500 universities: ~25-50 minutes
-    • 700+ universities: ~35-70 minutes
+<b>📈 TIME ESTIMATES (with current config):</b>
+• 100 universities: ~5-15 minutes
+• 300 universities: ~15-45 minutes  
+• 500 universities: ~25-75 minutes
+• 700+ universities: ~35-105 minutes
 
-    <b>Required Columns:</b>
-    - University/Institution names (first column)
-    - Country names (second column, optional)
+<b>Required Columns:</b>
+- University/Institution names (first column)
+- Country names (second column, optional)
 
-    <b>Optional Column:</b>
-    - Any ranking column (e.g., Leap Rank)
+<b>Optional Column:</b>
+- Any ranking column (e.g., Leap Rank)
 
-    <b>I will automatically detect columns and add:</b>
-    - Global Score (0-100)
-    - Global Rank (1 = best worldwide)
-    - Country Rank (1 = best in country)
-    - Data Source (Real Data/Estimated)
-    - Rate Limit Status
-    - Processing Time
+<b>I will automatically detect columns and add:</b>
+- Global Score (0-100)
+- Global Rank (1 = best worldwide)
+- Country Rank (1 = best in country)
+- Data Source (Real Data/Estimated)
+- Rate Limit Status
+- Processing Time
+- Data Sources Used
 
-    <b>Just send me your Excel file now!</b>
+<b>Just send me your Excel file now!</b>
+<i>Use /config to change data sources before processing large files.</i>
         """
         
         query.edit_message_text(
@@ -2391,11 +3212,11 @@ Please ensure your Excel file has the correct format:
         query.answer()
         data = query.data
         user_id = query.from_user.id
+        user_id_str = str(user_id)
         
         logger.info(f"Button click from user {user_id}: {data}")
         
         if data == "rate_status":
-            # Fix: Pass the query and context to a new method that handles callback queries
             self.rate_status_callback(query, context)
         elif data == "start_ranking":
             query.edit_message_text(
@@ -2405,6 +3226,46 @@ Please ensure your Excel file has the correct format:
             query.message.reply_text("Please use /rank command to start ranking.")
         elif data == "rank_excel":
             self.rank_excel_callback(query, context)
+        elif data == "config_menu":
+            self.config_callback(query, context)
+        elif data.startswith("toggle_"):
+            # Handle toggle buttons for configuration
+            parts = data.split("_")
+            if len(parts) >= 3:
+                source = parts[1]  # wikipedia, google, or webometrics
+                action = parts[2]  # enable or disable
+                
+                # Update configuration
+                enabled = (action == "enable")
+                user_config = self.update_user_config(user_id_str, source, enabled)
+                
+                # Show updated configuration
+                self.config_callback(query, context)
+        elif data.startswith("cancel_excel_"):
+            # Handle Excel cancellation via button
+            target_user_id = data.replace("cancel_excel_", "")
+            
+            # Only allow users to cancel their own processing
+            if str(user_id) != target_user_id:
+                query.answer("You can only cancel your own processing!", show_alert=True)
+                return
+            
+            if target_user_id not in self.user_excel_processing:
+                query.answer("No active processing found!", show_alert=True)
+                return
+            
+            # Cancel the processing
+            processing_info = self.user_excel_processing[target_user_id]
+            if 'thread' in processing_info:
+                processing_info['thread'].cancel()
+                processing_info['status'] = 'cancelling'
+            
+            query.edit_message_text(
+                "🛑 <b>Cancelling Excel processing...</b>\n\n"
+                "I'll send you the partial results once cancellation is complete.",
+                parse_mode=ParseMode.HTML
+            )
+        
         elif data == "view_tiers":
             self.show_tiers(query)
         elif data == "view_parameters":
@@ -2453,25 +3314,96 @@ Please ensure your Excel file has the correct format:
                 ranking_data = self.user_ranking_data[user_id]
                 self.show_sources(query, ranking_data)
     
+    def config_callback(self, query, context: CallbackContext):
+        """Handle configuration menu callback"""
+        user_id = query.from_user.id
+        user_id_str = str(user_id)
+        
+        # Get current configuration
+        user_config = self.get_user_config(user_id_str)
+        
+        config_text = f"""
+⚙️ <b>Data Source Configuration</b>
+
+Configure which data sources I should use for university rankings:
+
+<b>Current Settings:</b>
+1. Wikipedia: {'✅ Enabled' if user_config.enable_wikipedia else '❌ Disabled'}
+2. Google Search: {'✅ Enabled' if user_config.enable_google_search else '❌ Disabled'}
+3. Webometrics: {'✅ Enabled' if user_config.enable_webometrics else '❌ Disabled'}
+
+<b>Recommendations:</b>
+• Wikipedia: Always enabled (reliable, free, good rate limits)
+• Google Search: Enable for more accurate rankings (strict rate limits)
+• Webometrics: Enable for specialized ranking data (moderate rate limits)
+
+<b>⚠️ Rate Limit Warnings:</b>
+• Google: 10 requests/minute, 100/hour (very strict!)
+• Webometrics: 30 requests/minute, 500/hour
+• Wikipedia: 100 requests/minute, 2000/hour (generous)
+
+Use the buttons below to toggle each data source:
+        """
+        
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"{'✅ Wikipedia' if user_config.enable_wikipedia else '❌ Wikipedia'}",
+                    callback_data=f"toggle_wikipedia_{'disable' if user_config.enable_wikipedia else 'enable'}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'✅ Google Search' if user_config.enable_google_search else '❌ Google Search'}",
+                    callback_data=f"toggle_google_{'disable' if user_config.enable_google_search else 'enable'}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'✅ Webometrics' if user_config.enable_webometrics else '❌ Webometrics'}",
+                    callback_data=f"toggle_webometrics_{'disable' if user_config.enable_webometrics else 'enable'}"
+                )
+            ],
+            [
+                InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu"),
+                InlineKeyboardButton("📊 Check Rate Limits", callback_data="rate_status")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            config_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
+    
     def perform_ranking_callback(self, query, university_name: str, country: str):
         """Perform ranking from callback"""
         user_id = query.from_user.id
+        user_id_str = str(user_id)
         logger.info(f"Perform ranking callback for user {user_id}: {university_name}, {country}")
         
+        # Get user configuration
+        user_config = self.get_user_config(user_id_str)
+        
         query.edit_message_text(
-            f"🔍 <b>Analyzing {university_name}...</b>\n\nPlease wait while I gather data...",
+            f"🔍 <b>Analyzing {university_name}...</b>\n\n"
+            f"⚙️ Using: {', '.join(user_config.get_enabled_sources()) if user_config.get_enabled_sources() else 'Wikipedia only'}\n"
+            "Please wait while I gather data...",
             parse_mode=ParseMode.HTML
         )
         
         try:
-            # Get ranking data
-            ranking_data = self.ranking_system.rank_university(university_name, country, str(user_id))
+            # Get ranking data with user configuration
+            ranking_data = self.ranking_system.rank_university(
+                university_name, country, user_id_str, user_config
+            )
             
             # Store ranking data for rationale viewing
             self.user_ranking_data[user_id] = ranking_data
             
             # Format results
-            results_text = self.format_ranking_results(ranking_data)
+            results_text = self.format_ranking_results(ranking_data, user_config)
             
             # Send results
             query.edit_message_text(
@@ -2603,6 +3535,10 @@ Visibility & Presence: 5%
         for i, source in enumerate(ranking_data.sources, 1):
             sources_text += f"{i}. {source}\n"
         
+        # Add data sources used information
+        if hasattr(ranking_data, 'data_sources_used') and ranking_data.data_sources_used:
+            sources_text += f"\n<b>🔍 Data Sources Actually Used:</b> {', '.join(ranking_data.data_sources_used)}\n"
+        
         # Add confidence information
         if ranking_data.error_margin <= 3:
             confidence = "High"
@@ -2727,6 +3663,7 @@ Click the buttons below to get started!
         keyboard = [
             [InlineKeyboardButton("🎯 Rank a University", callback_data="start_ranking")],
             [InlineKeyboardButton("📊 Process Excel File", callback_data="rank_excel")],
+            [InlineKeyboardButton("⚙️ Configure Data Sources", callback_data="config_menu")],
             [InlineKeyboardButton("📈 Check Rate Limits", callback_data="rate_status")],
             [InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers")],
             [InlineKeyboardButton("📊 View Parameters", callback_data="view_parameters")]
@@ -2739,7 +3676,7 @@ Click the buttons below to get started!
             reply_markup=reply_markup
         )
     
-    def format_ranking_results(self, data: UniversityData) -> str:
+    def format_ranking_results(self, data: UniversityData, user_config: UserConfiguration = None) -> str:
         """Format ranking results as HTML text"""
         logger.debug(f"Formatting ranking results for {data.name}")
         # Header
@@ -2751,6 +3688,16 @@ Click the buttons below to get started!
 <b>📅 Analysis Date:</b> {data.timestamp}
 <b>📊 Data Confidence:</b> ±{data.error_margin} points
         """
+        
+        # Add configuration info if provided
+        if user_config:
+            enabled_sources = user_config.get_enabled_sources()
+            if enabled_sources:
+                results += f"<b>⚙️ Data Sources Enabled:</b> {', '.join(enabled_sources)}\n"
+        
+        # Add data sources actually used
+        if hasattr(data, 'data_sources_used') and data.data_sources_used:
+            results += f"<b>🔍 Data Sources Used:</b> {', '.join(data.data_sources_used)}\n"
         
         # Parameter scores
         results += "\n\n<b>📈 PARAMETER SCORES:</b>\n"
@@ -2848,12 +3795,13 @@ Click the buttons below to get started!
             [InlineKeyboardButton("🎯 Rank Another University", callback_data="rank_another")],
             [
                 InlineKeyboardButton("📈 Check Rate Limits", callback_data="rate_status"),
-                InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers")
+                InlineKeyboardButton("⚙️ Configure Data Sources", callback_data="config_menu")
             ],
             [
-                InlineKeyboardButton("📊 View Parameters", callback_data="view_parameters"),
-                InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")
-            ]
+                InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers"),
+                InlineKeyboardButton("📊 View Parameters", callback_data="view_parameters")
+            ],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -2891,14 +3839,20 @@ def main():
     
     # Create and run bot
     try:
-        print("🤖 Starting Enhanced pkUniRankBot with Rate Limiting...")
+        print("🤖 Starting Enhanced pkUniRankBot with User Configuration...")
         print(f"📊 Version: python-telegram-bot v{telegram.__version__}")
         print(f"📈 pandas v{pandas.__version__}")
         print("📝 Detailed logging enabled")
+        print("⚙️  User configuration system enabled")
         print("⚠️  Rate limits enforced for all external APIs")
         print("🔄 Auto-fallback to estimation when limits hit")
         print("📊 Rate limit status available via /rate_status")
         print("🔍 Progress tracking for all operations")
+        print("\n⚠️  DEFAULT SETTINGS:")
+        print("   • Wikipedia: ✅ Enabled")
+        print("   • Google Search: ❌ Disabled (strict rate limits)")
+        print("   • Webometrics: ❌ Disabled")
+        print("\n⚡ Use /config to enable Google and Webometrics as needed")
         
         bot = EnhancedUniRankBot(token)
         bot.start()
