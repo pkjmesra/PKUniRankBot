@@ -52,13 +52,13 @@ jobs:
         # Set up trap for graceful shutdown
         cleanup() {
             echo "Shutting down bot..."
-            pkill -f "python.*bot.py" 2>/dev/null || true
+            pkill -f "python.*Bot.py" 2>/dev/null || true
             exit 0
         }
         trap cleanup SIGINT SIGTERM
                 
         # Run the bot
-        python bot.py &
+        python /home/runner/work/PKUniRankBot/PKUniRankBot/ranking/pkUniRankBot.py &
                 
         # Keep the script running
         wait
@@ -74,7 +74,7 @@ jobs:
         sleep 10
         
         # Check if bot process is running
-        if pgrep -f "python.*bot.py" > /dev/null; then
+        if pgrep -f "python.*Bot.py" > /dev/null; then
             echo "✅ Bot is running successfully!"
             echo "Last 20 lines of log:"
             tail -20 bot.log || true
