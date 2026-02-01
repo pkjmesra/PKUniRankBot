@@ -34,6 +34,11 @@ pkUniRankBot - Telegram Bot for University Ranking with Excel Processing
 import os
 import logging
 import tempfile
+import threading
+try:
+    import thread
+except ImportError:
+    import _thread as thread
 import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
@@ -45,6 +50,8 @@ from telegram.ext import (
     Updater, CommandHandler, MessageHandler, Filters,
     CallbackQueryHandler, ConversationHandler, CallbackContext
 )
+
+MINUTES_2_IN_SECONDS = 120
 
 # Configure logging
 logging.basicConfig(
@@ -326,6 +333,7 @@ class UniRankBot:
         self.dispatcher.add_handler(CommandHandler("start", self.start_command))
         self.dispatcher.add_handler(CommandHandler("help", self.help_command))
         self.dispatcher.add_handler(CommandHandler("rank_excel", self.rank_excel_command))
+        self.dispatcher.add_error_handler(self.error_handler)
         
         # Document handler for Excel files
         self.dispatcher.add_handler(MessageHandler(
@@ -510,6 +518,42 @@ Please send me an Excel file with university data.
                     parse_mode=ParseMode.MARKDOWN
                 )
     
+    def error_handler(self, update: object, context: CallbackContext) -> None:
+        """Log the error and send a telegram message to notify the developer."""
+        # Log the error before we do anything else, so we can see it even if something breaks.
+        logger.error("Exception while handling an update:", exc_info=context.error)
+        import traceback
+        # traceback.format_exception returns the usual python message about an exception, but as a
+        # list of strings rather than a single string, so we have to join them together.
+        tb_list = traceback.format_exception(
+            None, context.error, context.error.__traceback__
+        )
+        tb_string = "".join(tb_list)
+        global start_time
+        timeSinceStarted = datetime.now() - start_time
+        if (
+            "telegram.error.Conflict" in tb_string
+        ):  # A newer 2nd instance was registered. We should politely shutdown.
+            if (
+                timeSinceStarted.total_seconds() >= MINUTES_2_IN_SECONDS
+            ):  # shutdown only if we have been running for over 2 minutes.
+                # This also prevents this newer instance to get shutdown.
+                # Instead the older instance will shutdown
+                print(
+                    f"Stopping due to conflict after running for {timeSinceStarted.total_seconds()/60} minutes."
+                )
+                try:
+                    # context.dispatcher.stop()
+                    thread.interrupt_main() # causes ctrl + c
+                    # sys.exit(0)
+                except RuntimeError:
+                    pass
+                except SystemExit:
+                    thread.interrupt_main()
+                # sys.exit(0)
+            else:
+                print("Other instance running!")
+
     def button_handler(self, update: Update, context: CallbackContext):
         """Handle button callbacks"""
         query = update.callback_query
