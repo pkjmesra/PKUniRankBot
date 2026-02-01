@@ -95,6 +95,112 @@ class UniversityData:
     rate_limit_info: List[Dict] = None
 
 # ============================================================================
+# PROGRESS TRACKING CLASS
+# ============================================================================
+
+class ProgressTracker:
+    """Tracks progress and estimates completion time for large operations"""
+    
+    def __init__(self, total_items: int, operation_name: str = "Processing"):
+        self.total_items = total_items
+        self.processed_items = 0
+        self.start_time = time.time()
+        self.operation_name = operation_name
+        self.item_times = []
+        self.rate_limits_hit = 0
+        logger.info(f"ProgressTracker initialized for {total_items} items")
+    
+    def update(self, items_processed: int = 1, rate_limit_hit: bool = False):
+        """Update progress tracker"""
+        self.processed_items += items_processed
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+        
+        if rate_limit_hit:
+            self.rate_limits_hit += 1
+        
+        # Track time for this batch
+        if items_processed > 0:
+            time_per_item = elapsed / self.processed_items
+            self.item_times.append(time_per_item)
+        
+        logger.debug(f"Progress update: {self.processed_items}/{self.total_items}")
+    
+    def get_progress_percentage(self) -> float:
+        """Get progress as percentage"""
+        if self.total_items == 0:
+            return 0
+        return (self.processed_items / self.total_items) * 100
+    
+    def get_estimated_time_remaining(self) -> str:
+        """Get estimated time remaining"""
+        if self.processed_items == 0:
+            return "Calculating..."
+        
+        elapsed = time.time() - self.start_time
+        if self.processed_items < 2:
+            return "Estimating..."
+        
+        # Use average of last 10 items for better estimation
+        recent_times = self.item_times[-10:] if len(self.item_times) >= 10 else self.item_times
+        if not recent_times:
+            return "Estimating..."
+        
+        avg_time_per_item = sum(recent_times) / len(recent_times)
+        remaining_items = self.total_items - self.processed_items
+        
+        # Add buffer for rate limits (30 seconds per expected rate limit)
+        rate_limit_buffer = max(0, self.rate_limits_hit * 30)
+        
+        estimated_seconds = (remaining_items * avg_time_per_item) + rate_limit_buffer
+        
+        if estimated_seconds < 60:
+            return f"{int(estimated_seconds)} seconds"
+        elif estimated_seconds < 3600:
+            minutes = int(estimated_seconds / 60)
+            seconds = int(estimated_seconds % 60)
+            return f"{minutes}m {seconds}s"
+        else:
+            hours = int(estimated_seconds / 3600)
+            minutes = int((estimated_seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+    
+    def get_progress_message(self) -> str:
+        """Get formatted progress message"""
+        percentage = self.get_progress_percentage()
+        elapsed = time.time() - self.start_time
+        elapsed_str = self._format_time(elapsed)
+        remaining_str = self.get_estimated_time_remaining()
+        
+        message = f"""
+📊 <b>{self.operation_name} Progress</b>
+
+✅ Processed: {self.processed_items}/{self.total_items} ({percentage:.1f}%)
+⏱️ Elapsed: {elapsed_str}
+⏳ Estimated remaining: {remaining_str}
+
+⚠️ Rate limits hit: {self.rate_limits_hit}
+"""
+        
+        if self.rate_limits_hit > 0:
+            message += "\n<i>Note: Rate limits may extend processing time</i>"
+        
+        return message
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds into readable time"""
+        if seconds < 60:
+            return f"{int(seconds)} seconds"
+        elif seconds < 3600:
+            minutes = int(seconds / 60)
+            seconds = int(seconds % 60)
+            return f"{minutes}m {seconds}s"
+        else:
+            hours = int(seconds / 3600)
+            minutes = int((seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+
+# ============================================================================
 # API RATE LIMITING CLASSES
 # ============================================================================
 
@@ -1281,6 +1387,154 @@ class EnhancedUniversityRankingSystem(UniversityRankingSystem):
         
         logger.info(f"Ranking complete for {university_name}: Score={composite}, Tier={tier}, Estimated={is_estimated}")
         return result
+    
+    def process_excel_file(self, input_path: str, user_id: Optional[str] = None, 
+                          progress_callback: Optional[callable] = None) -> Tuple[str, List[Dict]]:
+        """Process Excel file with multiple universities and progress tracking"""
+        logger.info(f"Processing Excel file: {input_path} for user: {user_id}")
+        
+        try:
+            # Read the Excel file
+            df = pd.read_excel(input_path)
+            logger.info(f"Excel file loaded. Shape: {df.shape}, Columns: {list(df.columns)}")
+            
+            # Create a copy for results
+            result_df = df.copy()
+            
+            # Initialize progress tracker
+            total_universities = len(result_df)
+            progress_tracker = ProgressTracker(total_universities, "University Ranking")
+            
+            # Initial progress update
+            if progress_callback:
+                progress_callback(progress_tracker.get_progress_message())
+            
+            # Prepare new columns
+            result_df['Global Score'] = 0.0
+            result_df['Global Rank'] = 0
+            result_df['Country Rank'] = 0
+            result_df['Data Source'] = 'Estimated'
+            result_df['Rate Limited'] = 'No'
+            result_df['Processing Time (s)'] = 0.0
+            result_df['Error'] = ''
+            
+            rate_limit_issues = []
+            
+            for idx, row in result_df.iterrows():
+                try:
+                    university_name = str(row.iloc[0])  # First column is university name
+                    country = str(row.iloc[1]) if len(row) > 1 else ""  # Second column is country
+                    
+                    logger.info(f"Processing {idx+1}/{total_universities}: {university_name}")
+                    
+                    # Check rate limits before processing
+                    rate_limit_hit = False
+                    try:
+                        # Check Wikipedia rate limit
+                        self.data_fetcher.rate_limiter.check_rate_limit(APIType.WIKIPEDIA, user_id)
+                        # Check Google rate limit
+                        self.data_fetcher.rate_limiter.check_rate_limit(APIType.GOOGLE_SEARCH, user_id)
+                    except RateLimitExceededException as e:
+                        logger.warning(f"Rate limit hit for {university_name}: {e}")
+                        result_df.at[idx, 'Rate Limited'] = 'Yes'
+                        rate_limit_hit = True
+                        rate_limit_issues.append({
+                            'university': university_name,
+                            'api': e.api_type.value,
+                            'reset_time': e.reset_time,
+                            'message': e.message
+                        })
+                    
+                    # Get ranking data
+                    start_time = time.time()
+                    ranking_data = self.rank_university(university_name, country, user_id)
+                    processing_time = time.time() - start_time
+                    
+                    # Update result dataframe
+                    result_df.at[idx, 'Global Score'] = ranking_data.composite
+                    result_df.at[idx, 'Data Source'] = 'Real Data' if not ranking_data.is_estimated else 'Estimated'
+                    result_df.at[idx, 'Processing Time (s)'] = round(processing_time, 2)
+                    
+                    # Update progress tracker
+                    progress_tracker.update(1, rate_limit_hit)
+                    
+                    # Send progress update every 10 universities or every 30 seconds
+                    if progress_callback and (idx % 10 == 0 or time.time() - start_time > 30):
+                        progress_callback(progress_tracker.get_progress_message())
+                    
+                    # Add dynamic delay based on rate limit status
+                    if rate_limit_hit:
+                        delay_time = 10  # Longer delay if rate limit was hit
+                    elif idx % 20 == 0:
+                        delay_time = 5  # Periodic longer delay
+                    else:
+                        delay_time = 1  # Normal delay
+                    
+                    time.sleep(delay_time)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing row {idx}: {e}")
+                    result_df.at[idx, 'Data Source'] = 'Error'
+                    result_df.at[idx, 'Error'] = str(e)[:100]
+                    progress_tracker.update(1, False)
+                    continue
+            
+            # Sort by Global Score for ranking
+            result_df = result_df.sort_values(by='Global Score', ascending=False)
+            result_df['Global Rank'] = range(1, len(result_df) + 1)
+            
+            # Calculate country ranks
+            if 'Country' in result_df.columns or len(result_df.columns) > 1:
+                country_col = result_df.columns[1] if len(result_df.columns) > 1 else 'Country'
+                result_df['Country Rank'] = result_df.groupby(country_col)['Global Score'].rank(
+                    method='dense', ascending=False
+                ).astype(int)
+            
+            # Create output file
+            output_path = tempfile.mktemp(suffix='_ranked.xlsx')
+            
+            # Create Excel writer with multiple sheets
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # Main rankings sheet
+                result_df.to_excel(writer, sheet_name='Rankings', index=False)
+                
+                # Summary sheet
+                summary_data = {
+                    'Total Universities': [total_universities],
+                    'Processed Successfully': [progress_tracker.processed_items],
+                    'Errors': [total_universities - progress_tracker.processed_items],
+                    'Real Data Used': [len(result_df[result_df['Data Source'] == 'Real Data'])],
+                    'Estimated Data Used': [len(result_df[result_df['Data Source'] == 'Estimated'])],
+                    'Rate Limited Cases': [len(result_df[result_df['Rate Limited'] == 'Yes'])],
+                    'Average Processing Time (s)': [result_df['Processing Time (s)'].mean()],
+                    'Total Processing Time (s)': [result_df['Processing Time (s)'].sum()],
+                    'Rate Limits Hit': [progress_tracker.rate_limits_hit]
+                }
+                summary_df = pd.DataFrame(summary_data)
+                summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Rate limit issues sheet (if any)
+                if rate_limit_issues:
+                    issues_df = pd.DataFrame(rate_limit_issues)
+                    issues_df.to_excel(writer, sheet_name='Rate Limit Issues', index=False)
+                
+                # Processing stats sheet
+                stats_data = {
+                    'Start Time': [datetime.fromtimestamp(progress_tracker.start_time).strftime("%Y-%m-%d %H:%M:%S")],
+                    'End Time': [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+                    'Total Time': [progress_tracker._format_time(time.time() - progress_tracker.start_time)],
+                    'Items per Minute': [progress_tracker.processed_items / ((time.time() - progress_tracker.start_time) / 60) if (time.time() - progress_tracker.start_time) > 0 else 0],
+                    'Estimated Completion Accuracy': ['Based on last 10 items'] if len(progress_tracker.item_times) >= 10 else ['Based on all items']
+                }
+                stats_df = pd.DataFrame(stats_data)
+                stats_df.to_excel(writer, sheet_name='Processing Stats', index=False)
+            
+            logger.info(f"Excel processing complete. Output saved to: {output_path}")
+            return output_path, rate_limit_issues
+            
+        except Exception as e:
+            logger.error(f"Error processing Excel file: {e}")
+            raise
 
 # ============================================================================
 # ENHANCED BOT WITH RATE LIMITING
@@ -1552,16 +1806,28 @@ Institutional web presence, brand recognition.
         update.message.reply_text(params_text, parse_mode=ParseMode.HTML)
     
     def rank_excel_command(self, update: Update, context: CallbackContext):
-        """Handle /rank_excel command"""
+        """Handle /rank_excel command with warnings for large files"""
         logger.info(f"Rank_excel command from user: {update.effective_user.id}")
         instructions = """
 <b>📊 Excel Ranking Instructions</b>
 
 Please send me an Excel file (.xlsx or .xls) with university data.
 
+<b>⚠️ IMPORTANT FOR LARGE FILES:</b>
+• 700+ universities will take approximately 30-60 minutes
+• I'll send progress updates every 30 seconds
+• Rate limits are strictly enforced to avoid API blocks
+• Large files will use more estimated data
+
+<b>📈 TIME ESTIMATES:</b>
+• 100 universities: ~5-10 minutes
+• 300 universities: ~15-30 minutes  
+• 500 universities: ~25-50 minutes
+• 700+ universities: ~35-70 minutes
+
 <b>Required Columns:</b>
-- University/Institution names
-- Country names
+- University/Institution names (first column)
+- Country names (second column, optional)
 
 <b>Optional Column:</b>
 - Any ranking column (e.g., Leap Rank)
@@ -1571,9 +1837,9 @@ Please send me an Excel file (.xlsx or .xls) with university data.
 - Global Rank (1 = best worldwide)
 - Country Rank (1 = best in country)
 - Data Source (Real Data/Estimated)
-- Rank Difference (highlighted if differs from Leap Rank)
+- Rate Limit Status
+- Processing Time
 
-<b>Rate Limits:</b> I respect API rate limits. Large files may use estimated data.
 <b>Just send me your Excel file now!</b>
         """
         
@@ -1581,7 +1847,21 @@ Please send me an Excel file (.xlsx or .xls) with university data.
     
     def rate_status_command(self, update: Update, context: CallbackContext):
         """Check current API rate limit status"""
-        logger.info(f"Rate_status command from user: {update.effective_user.id}")
+        # Handle both message updates and callback queries
+        if update.message:
+            user_id = update.effective_user.id
+            reply_method = update.message.reply_text
+        elif update.callback_query:
+            # This shouldn't happen since button handler redirects to callback method,
+            # but let's handle it just in case
+            user_id = update.callback_query.from_user.id
+            reply_method = lambda text, **kwargs: update.callback_query.edit_message_text(text, **kwargs)
+        else:
+            logger.error("Rate status called without message or callback_query")
+            return
+        
+        logger.info(f"Rate_status command from user: {user_id}")
+        
         try:
             # Get rate limiter from ranking system
             rate_limiter = self.ranking_system.data_fetcher.rate_limiter
@@ -1625,11 +1905,14 @@ Please send me an Excel file (.xlsx or .xls) with university data.
             
             status_text += "\n<i>Note: Limits reset automatically. Large Excel files may hit limits.</i>"
             
-            update.message.reply_text(status_text, parse_mode=ParseMode.HTML)
+            reply_method(
+                status_text,
+                parse_mode=ParseMode.HTML
+            )
             
         except Exception as e:
             logger.error(f"Error getting rate status: {e}")
-            update.message.reply_text(
+            reply_method(
                 "❌ Could not retrieve rate limit status. Please try again later.",
                 parse_mode=ParseMode.HTML
             )
@@ -1801,7 +2084,7 @@ Using estimated data for this ranking.
             )
     
     def handle_excel_file(self, update: Update, context: CallbackContext):
-        """Enhanced Excel file handling with rate limit monitoring"""
+        """Enhanced Excel file handling with progress updates"""
         user_id = str(update.effective_user.id)
         logger.info(f"Excel file received from user {user_id}")
         
@@ -1836,7 +2119,8 @@ Using estimated data for this ranking.
             # Mark user as processing
             self.user_excel_processing[user_id] = {
                 'message_id': processing_msg.message_id,
-                'start_time': datetime.now()
+                'start_time': datetime.now(),
+                'last_update': datetime.now()
             }
             logger.info(f"Marked user {user_id} as processing")
             
@@ -1850,128 +2134,257 @@ Using estimated data for this ranking.
                 input_path = tmp_file.name
             logger.info(f"File downloaded to {input_path}")
             
-            # Send progress update
-            time.sleep(1)
-            processing_msg.edit_text(
-                "📊 <b>Processing Started!</b>\n\n"
-                "Fetching real data for all universities...\n"
-                "Respecting rate limits to avoid API blocks.\n\n"
-                "<b>Current API Status:</b>\n"
-                "✅ Wikipedia: Available\n"
-                "✅ Google Search: Available\n"
-                "✅ Webometrics: Available\n\n"
-                "<i>Processing in batches with delays...</i>",
-                parse_mode=ParseMode.HTML
-            )
+            # Define progress callback function
+            def send_progress_update(progress_message: str):
+                """Send progress update to user"""
+                try:
+                    # Only update every 30 seconds to avoid spamming
+                    now = datetime.now()
+                    last_update = self.user_excel_processing.get(user_id, {}).get('last_update')
+                    
+                    if last_update and (now - last_update).total_seconds() >= 30:
+                        processing_msg.edit_text(
+                            progress_message,
+                            parse_mode=ParseMode.HTML
+                        )
+                        self.user_excel_processing[user_id]['last_update'] = now
+                        logger.debug(f"Sent progress update to user {user_id}")
+                except Exception as e:
+                    logger.error(f"Error sending progress update: {e}")
             
-            # Process the Excel file
+            # Process the Excel file with progress updates
             logger.info(f"Starting Excel processing for user {user_id}")
-            output_path, rate_limit_issues = self.ranking_system.process_excel_file(input_path, user_id)
-            logger.info(f"Excel processing complete. Output: {output_path}, Rate limit issues: {len(rate_limit_issues)}")
             
-            # Prepare final message with rate limit summary
-            final_message = "🎯 <b>Enhanced University Rankings - Complete!</b>\n\n"
-            
-            if rate_limit_issues:
-                # Group rate limit issues by API
-                api_issues = {}
-                for issue in rate_limit_issues:
-                    api = issue.get('api', 'Unknown')
-                    if api not in api_issues:
-                        api_issues[api] = []
-                    api_issues[api].append(issue)
+            try:
+                output_path, rate_limit_issues = self.ranking_system.process_excel_file(
+                    input_path, 
+                    user_id,
+                    progress_callback=send_progress_update
+                )
                 
-                final_message += "⚠️ <b>RATE LIMIT ISSUES ENCOUNTERED:</b>\n"
+                logger.info(f"Excel processing complete. Output: {output_path}, Rate limit issues: {len(rate_limit_issues)}")
                 
-                for api, issues in api_issues.items():
-                    # Get latest reset time for this API
-                    reset_times = [issue.get('reset_time') for issue in issues if issue.get('reset_time')]
-                    if reset_times:
-                        latest_reset = max(reset_times)
-                        if isinstance(latest_reset, datetime):
-                            reset_str = latest_reset.strftime("%H:%M:%S")
-                            final_message += f"• <b>{api.upper()}</b>: {len(issues)} universities affected. Resets at {reset_str}\n"
-                        else:
-                            final_message += f"• <b>{api.upper()}</b>: {len(issues)} universities affected\n"
-                    else:
-                        final_message += f"• <b>{api.upper()}</b>: {len(issues)} universities affected\n"
+                # Prepare final message with detailed statistics
+                final_message = self._create_final_summary_message(rate_limit_issues, output_path)
                 
-                final_message += "\n"
-            
-            # Add color coding explanation
-            final_message += "<b>📊 COLOR CODING IN EXCEL:</b>\n"
-            final_message += "🟩 Green = Real data from internet sources\n"
-            final_message += "🟧 Orange = Estimated scores (no rate limits)\n"
-            final_message += "🟥 Red = Estimated due to rate limits\n"
-            final_message += "🟨 Yellow = Rank difference from Leap Rank\n\n"
-            
-            # Add sheet information
-            final_message += "<b>📄 SHEETS INCLUDED:</b>\n"
-            final_message += "• Rankings: Main results with scores\n"
-            final_message += "• Summary: Processing statistics\n"
-            if rate_limit_issues:
-                final_message += "• Rate Limit Issues: Detailed API limit information\n"
-            
-            # Send the file
-            with open(output_path, 'rb') as result_file:
-                logger.info(f"Sending result file to user {user_id}")
-                context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=result_file,
-                    filename=os.path.basename(output_path),
-                    caption=final_message,
+                # Send the file
+                with open(output_path, 'rb') as result_file:
+                    logger.info(f"Sending result file to user {user_id}")
+                    context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=result_file,
+                        filename=f"ranked_{document.file_name}",
+                        caption=final_message,
+                        parse_mode=ParseMode.HTML
+                    )
+                logger.info(f"Result file sent successfully to user {user_id}")
+                
+            except Exception as e:
+                logger.error(f"Error during Excel processing: {e}")
+                processing_msg.edit_text(
+                    f"❌ <b>Error Processing File</b>\n\n{str(e)[:500]}",
                     parse_mode=ParseMode.HTML
                 )
-            logger.info(f"Result file sent successfully to user {user_id}")
             
             # Clean up temporary files and user tracking
-            try:
-                os.unlink(input_path)
-                os.unlink(output_path)
-                if user_id in self.user_excel_processing:
-                    del self.user_excel_processing[user_id]
-                logger.info(f"Cleanup completed for user {user_id}")
-            except Exception as e:
-                logger.error(f"Cleanup error for user {user_id}: {e}")
+            self._cleanup_processing(user_id, input_path, output_path if 'output_path' in locals() else None)
             
         except RateLimitExceededException as e:
-            # Handle specific rate limit exception
-            logger.error(f"Rate limit exceeded during Excel processing for user {user_id}: {e}")
-            error_msg = f"""
+            self._handle_rate_limit_exception(update, user_id, e)
+        except Exception as e:
+            self._handle_general_exception(update, user_id, e)
+    
+    def _create_final_summary_message(self, rate_limit_issues: List[Dict], output_path: str) -> str:
+        """Create final summary message"""
+        final_message = "🎯 <b>Enhanced University Rankings - Complete!</b>\n\n"
+        
+        if rate_limit_issues:
+            # Group rate limit issues by API
+            api_issues = {}
+            for issue in rate_limit_issues:
+                api = issue.get('api', 'Unknown')
+                if api not in api_issues:
+                    api_issues[api] = []
+                api_issues[api].append(issue)
+            
+            final_message += "⚠️ <b>RATE LIMIT ISSUES ENCOUNTERED:</b>\n"
+            
+            for api, issues in api_issues.items():
+                affected_count = len(issues)
+                final_message += f"• <b>{api.upper()}</b>: {affected_count} universities affected\n"
+            
+            final_message += "\n"
+        
+        # Add color coding explanation
+        final_message += "<b>📊 COLOR CODING IN EXCEL:</b>\n"
+        final_message += "🟩 Green = Real data from internet sources\n"
+        final_message += "🟧 Orange = Estimated scores (no rate limits)\n"
+        final_message += "🟥 Red = Estimated due to rate limits\n"
+        final_message += "🟨 Yellow = Rank difference from Leap Rank\n\n"
+        
+        # Add sheet information
+        final_message += "<b>📄 SHEETS INCLUDED:</b>\n"
+        final_message += "• Rankings: Main results with scores and ranks\n"
+        final_message += "• Summary: Processing statistics and metrics\n"
+        final_message += "• Processing Stats: Timing and performance data\n"
+        if rate_limit_issues:
+            final_message += "• Rate Limit Issues: Detailed API limit information\n"
+        
+        final_message += "\n<i>Note: Check the 'Summary' sheet for detailed processing statistics.</i>"
+        
+        return final_message
+    
+    def _cleanup_processing(self, user_id: str, input_path: str, output_path: Optional[str] = None):
+        """Clean up processing resources"""
+        try:
+            if os.path.exists(input_path):
+                os.unlink(input_path)
+            if output_path and os.path.exists(output_path):
+                os.unlink(output_path)
+            if user_id in self.user_excel_processing:
+                del self.user_excel_processing[user_id]
+            logger.info(f"Cleanup completed for user {user_id}")
+        except Exception as e:
+            logger.error(f"Cleanup error for user {user_id}: {e}")
+    
+    def _handle_rate_limit_exception(self, update: Update, user_id: str, e: RateLimitExceededException):
+        """Handle rate limit exceptions"""
+        logger.error(f"Rate limit exceeded during Excel processing for user {user_id}: {e}")
+        error_msg = f"""
 ❌ <b>RATE LIMIT EXCEEDED DURING PROCESSING</b>
 
 <b>API:</b> {e.api_type.value.upper()}
 <b>Limit:</b> {e.limit_details}
 <b>Resets at:</b> {e.reset_time.strftime("%H:%M:%S")}
 
-Please try again after the reset time, or use a smaller Excel file.
-            """
-            
-            update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-            
-            # Clean up
-            if user_id in self.user_excel_processing:
-                del self.user_excel_processing[user_id]
-            
-        except Exception as e:
-            logger.error(f"Error processing Excel file for user {user_id}: {e}", exc_info=True)
-            error_msg = f"""
+Please try again after the reset time, or split your Excel file into smaller batches.
+"""
+        
+        update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+        self._cleanup_processing(user_id, None, None)
+    
+    def _handle_general_exception(self, update: Update, user_id: str, e: Exception):
+        """Handle general exceptions"""
+        logger.error(f"Error processing Excel file for user {user_id}: {e}", exc_info=True)
+        error_msg = f"""
 ❌ <b>ERROR PROCESSING FILE</b>
 
 {str(e)[:500]}
 
 Please ensure your Excel file has the correct format:
-• University/Institution names
-• Country names
+• University/Institution names (first column)
+• Country names (second column, optional)
 • (Optional) Ranking column
-            """
-            
-            update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-            
-            # Clean up
-            if user_id in self.user_excel_processing:
-                del self.user_excel_processing[user_id]
+"""
+        
+        update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+        self._cleanup_processing(user_id, None, None)
     
+    def rate_status_callback(self, query, context: CallbackContext):
+        """Check current API rate limit status for callback queries"""
+        user_id = query.from_user.id
+        logger.info(f"Rate_status callback from user: {user_id}")
+        
+        try:
+            # Get rate limiter from ranking system
+            rate_limiter = self.ranking_system.data_fetcher.rate_limiter
+            
+            # Get status of all APIs
+            all_status = rate_limiter.get_all_status()
+            
+            status_text = "📊 <b>CURRENT API RATE LIMIT STATUS</b>\n\n"
+            
+            for status in all_status:
+                api_name = status['api'].upper()
+                used_minute = status['calls_last_minute']
+                limit_minute = status['minute_limit']
+                available_minute = status['available_minute']
+                
+                # Create status indicator
+                if available_minute > limit_minute * 0.5:
+                    indicator = "🟢"
+                elif available_minute > limit_minute * 0.2:
+                    indicator = "🟡"
+                else:
+                    indicator = "🔴"
+                
+                status_text += f"{indicator} <b>{api_name}</b>\n"
+                status_text += f"   Minute: {used_minute}/{limit_minute} (Avail: {available_minute})\n"
+                status_text += f"   Hour: {status['calls_last_hour']}/{status['hourly_limit']}\n"
+                status_text += f"   Day: {status['calls_last_day']}/{status['daily_limit']}\n\n"
+            
+            # Add next reset info
+            next_reset = None
+            for api_type in APIType:
+                reset_time = rate_limiter.get_next_reset_time(api_type)
+                if reset_time:
+                    if next_reset is None or reset_time < next_reset:
+                        next_reset = reset_time
+            
+            if next_reset:
+                time_until = next_reset - datetime.now()
+                minutes_until = max(0, int(time_until.total_seconds() / 60))
+                status_text += f"⏰ <b>Next reset in:</b> {minutes_until} minutes\n"
+            
+            status_text += "\n<i>Note: Limits reset automatically. Large Excel files may hit limits.</i>"
+            
+            query.edit_message_text(
+                status_text,
+                parse_mode=ParseMode.HTML
+            )
+            
+        except Exception as e:
+            logger.error(f"Error getting rate status: {e}")
+            query.edit_message_text(
+                "❌ Could not retrieve rate limit status. Please try again later.",
+                parse_mode=ParseMode.HTML
+            )
+
+    def rank_excel_callback(self, query, context: CallbackContext):
+        """Handle rank_excel command for callback queries"""
+        user_id = query.from_user.id
+        logger.info(f"Rank_excel callback from user: {user_id}")
+        
+        instructions = """
+    <b>📊 Excel Ranking Instructions</b>
+
+    Please send me an Excel file (.xlsx or .xls) with university data.
+
+    <b>⚠️ IMPORTANT FOR LARGE FILES:</b>
+    • 700+ universities will take approximately 30-60 minutes
+    • I'll send progress updates every 30 seconds
+    • Rate limits are strictly enforced to avoid API blocks
+    • Large files will use more estimated data
+
+    <b>📈 TIME ESTIMATES:</b>
+    • 100 universities: ~5-10 minutes
+    • 300 universities: ~15-30 minutes  
+    • 500 universities: ~25-50 minutes
+    • 700+ universities: ~35-70 minutes
+
+    <b>Required Columns:</b>
+    - University/Institution names (first column)
+    - Country names (second column, optional)
+
+    <b>Optional Column:</b>
+    - Any ranking column (e.g., Leap Rank)
+
+    <b>I will automatically detect columns and add:</b>
+    - Global Score (0-100)
+    - Global Rank (1 = best worldwide)
+    - Country Rank (1 = best in country)
+    - Data Source (Real Data/Estimated)
+    - Rate Limit Status
+    - Processing Time
+
+    <b>Just send me your Excel file now!</b>
+        """
+        
+        query.edit_message_text(
+            instructions,
+            parse_mode=ParseMode.HTML
+        )
+
     def button_handler(self, update: Update, context: CallbackContext):
         """Handle button callbacks"""
         query = update.callback_query
@@ -1982,7 +2395,8 @@ Please ensure your Excel file has the correct format:
         logger.info(f"Button click from user {user_id}: {data}")
         
         if data == "rate_status":
-            self.rate_status_command(query.message, context)
+            # Fix: Pass the query and context to a new method that handles callback queries
+            self.rate_status_callback(query, context)
         elif data == "start_ranking":
             query.edit_message_text(
                 "🎓 <b>University Ranking</b>\n\nPlease enter the university name:",
@@ -1990,7 +2404,7 @@ Please ensure your Excel file has the correct format:
             )
             query.message.reply_text("Please use /rank command to start ranking.")
         elif data == "rank_excel":
-            self.rank_excel_command(query.message, context)
+            self.rank_excel_callback(query, context)
         elif data == "view_tiers":
             self.show_tiers(query)
         elif data == "view_parameters":
