@@ -801,18 +801,41 @@ class UniversityRankingSystem:
             'D': (0, 44.999, "🚨 POOR")
         }
         
-        # Database of known universities
+        # Database of known universities - FIXED SCORES
         self.university_db = self.load_university_database()
         
-        # Country quality multipliers
+        # Country quality multipliers - EXPANDED
         self.country_multipliers = {
-            'USA': 1.2, 'UK': 1.15, 'Canada': 1.1, 'Australia': 1.1,
-            'Germany': 1.1, 'Switzerland': 1.15, 'Singapore': 1.1,
-            'Japan': 1.05, 'Netherlands': 1.05, 'Sweden': 1.05,
-            'France': 1.0, 'Italy': 0.95, 'Spain': 0.95,
-            'China': 0.9, 'India': 0.85, 'Brazil': 0.85,
-            'Russia': 0.85, 'South Africa': 0.85,
-            'Ireland': 1.0, 'NewZealand': 1.0, 'New Zealand': 1.0
+            # Tier 1: World leaders
+            'USA': 1.2, 'UK': 1.15, 
+            
+            # Tier 2: Strong systems
+            'CANADA': 1.1, 'CAN': 1.1, 'AUSTRALIA': 1.1, 'AUS': 1.1,
+            'GERMANY': 1.1, 'DEU': 1.1, 'SWITZERLAND': 1.15, 'CHE': 1.15,
+            'SWEDEN': 1.05, 'SWE': 1.05, 'NETHERLANDS': 1.05, 'NLD': 1.05,
+            'DENMARK': 1.05, 'DNK': 1.05, 'FINLAND': 1.05, 'FIN': 1.05,
+            'NORWAY': 1.05, 'NOR': 1.05,
+            
+            # Tier 3: Developed systems
+            'FRANCE': 1.0, 'FRA': 1.0, 'ITALY': 0.95, 'ITA': 0.95,
+            'SPAIN': 0.95, 'ESP': 0.95, 'PORTUGAL': 0.9, 'PRT': 0.9,
+            'GREECE': 0.9, 'GRC': 0.9,
+            
+            # Tier 4: Emerging leaders
+            'JAPAN': 1.05, 'JPN': 1.05, 'SOUTH KOREA': 1.05, 'KOR': 1.05,
+            'SINGAPORE': 1.1, 'SGP': 1.1, 'HONG KONG': 1.1, 'HKG': 1.1,
+            
+            # Tier 5: Major developing
+            'CHINA': 0.9, 'CHN': 0.9, 'INDIA': 0.85, 'IND': 0.85,
+            'BRAZIL': 0.85, 'BRA': 0.85, 'RUSSIA': 0.85, 'RUS': 0.85,
+            'SOUTH AFRICA': 0.85, 'ZAF': 0.85, 'MEXICO': 0.85, 'MEX': 0.85,
+            
+            # Tier 6: Others
+            'IRELAND': 1.0, 'IRL': 1.0, 'NEW ZEALAND': 1.0, 'NZL': 1.0,
+            'NEWZEALAND': 1.0,
+            
+            # Default for unknown countries
+            'GLOBAL': 1.0
         }
         
         # Parameter rationale templates
@@ -878,7 +901,7 @@ class UniversityRankingSystem:
         logger.info(f"UniversityRankingSystem initialized with {len(self.university_db)} universities in database")
     
     def load_university_database(self) -> Dict:
-        """Load university database with pre-calculated scores"""
+        """Load university database with pre-calculated scores - IMPROVED"""
         logger.info("Loading university database")
         db = {
             'bryant university': {
@@ -896,7 +919,7 @@ class UniversityRankingSystem:
             'massachusetts institute of technology': {
                 'country': 'USA',
                 'type': 'RESEARCH_UNIVERSITY',
-                'scores': {'academic': 24, 'graduate': 23, 'roi': 22, 
+                'scores': {'academic': 25, 'graduate': 24, 'roi': 22, 
                           'fsr': 14, 'transparency': 9, 'visibility': 5},
                 'description': 'World-renowned research university',
                 'rationale': {
@@ -956,8 +979,8 @@ class UniversityRankingSystem:
             'conestoga college': {
                 'country': 'Canada',
                 'type': 'COLLEGE_POLYTECHNIC',
-                'scores': {'academic': 4.0, 'graduate': 20.0, 'roi': 17.5, 
-                          'fsr': 12.5, 'transparency': 6.5, 'visibility': 3.5},
+                'scores': {'academic': 4, 'graduate': 20, 'roi': 18, 
+                          'fsr': 13, 'transparency': 7, 'visibility': 4},
                 'description': 'Canadian polytechnic institute',
                 'rationale': {
                     'academic': ['Applied learning focus', 'Limited research scope'],
@@ -968,8 +991,8 @@ class UniversityRankingSystem:
             'algonquin college': {
                 'country': 'Canada',
                 'type': 'COLLEGE_POLYTECHNIC',
-                'scores': {'academic': 3.5, 'graduate': 19.0, 'roi': 17.0, 
-                          'fsr': 12.0, 'transparency': 6.0, 'visibility': 3.0},
+                'scores': {'academic': 4, 'graduate': 19, 'roi': 17, 
+                          'fsr': 12, 'transparency': 6, 'visibility': 3},
                 'description': 'Canadian college',
                 'rationale': {
                     'academic': ['Vocational education focus', 'Certificate/diploma programs'],
@@ -980,8 +1003,8 @@ class UniversityRankingSystem:
             'north dakota state university': {
                 'country': 'USA',
                 'type': 'RESEARCH_UNIVERSITY',
-                'scores': {'academic': 15.6, 'graduate': 15.0, 'roi': 16.1, 
-                          'fsr': 11.0, 'transparency': 9.0, 'visibility': 4.0},
+                'scores': {'academic': 16, 'graduate': 15, 'roi': 16, 
+                          'fsr': 11, 'transparency': 9, 'visibility': 4},
                 'description': 'Public research university',
                 'rationale': {
                     'academic': ['Regional research strength', 'Specialized programs'],
@@ -1011,6 +1034,43 @@ class UniversityRankingSystem:
                     'academic': ['Strong research in Australia', 'International student focus'],
                     'graduate': ['Good Australia/NZ employment', 'Asia-Pacific opportunities'],
                     'roi': ['International student market', 'Strong Australian education brand']
+                }
+            },
+            # Add more diverse examples
+            'community college of philadelphia': {
+                'country': 'USA',
+                'type': 'COLLEGE_POLYTECHNIC',
+                'scores': {'academic': 3, 'graduate': 16, 'roi': 18, 
+                          'fsr': 11, 'transparency': 5, 'visibility': 2},
+                'description': 'Urban community college',
+                'rationale': {
+                    'academic': ['Basic skills focus', 'Associate degree programs'],
+                    'graduate': ['Local employment focus', 'Transfer opportunities'],
+                    'roi': ['Very affordable', 'Open admissions']
+                }
+            },
+            'california institute of technology': {
+                'country': 'USA',
+                'type': 'RESEARCH_UNIVERSITY',
+                'scores': {'academic': 25, 'graduate': 24, 'roi': 23, 
+                          'fsr': 14, 'transparency': 9, 'visibility': 5},
+                'description': 'Elite science and engineering institute',
+                'rationale': {
+                    'academic': ['Nobel prize density highest in world', 'Cutting-edge research'],
+                    'graduate': ['Top PhD placements', 'Silicon Valley recruitment'],
+                    'roi': ['Exceptional ROI for STEM graduates', 'Strong industry partnerships']
+                }
+            },
+            'university of cape town': {
+                'country': 'South Africa',
+                'type': 'RESEARCH_UNIVERSITY',
+                'scores': {'academic': 18, 'graduate': 17, 'roi': 15, 
+                          'fsr': 11, 'transparency': 7, 'visibility': 3},
+                'description': 'Top African university',
+                'rationale': {
+                    'academic': ['Leading research in Africa', 'Strong medical school'],
+                    'graduate': ['Good African employment', 'International recognition'],
+                    'roi': ['Good value for African context', 'Scholarship availability']
                 }
             }
         }
@@ -1056,6 +1116,69 @@ class UniversityRankingSystem:
         }
         logger.info(f"Loaded {len(the_data)} THE rankings")
         return the_data
+    
+    def estimate_scores(self, name: str, country: str) -> Dict[str, float]:
+        """Estimate scores for unknown universities - IMPROVED"""
+        logger.info(f"Estimating scores for {name} in {country}")
+        name_lower = name.lower()
+        country_upper = country.upper().strip() if country else "GLOBAL"
+        
+        # Get base scores based on university type and characteristics
+        base_scores = self._get_base_scores_by_type(name_lower)
+        
+        # Apply country multiplier - FIXED
+        country_mult = self._get_country_multiplier(country_upper)
+        
+        # Apply adjustments based on name patterns
+        adjusted_scores = self._apply_name_pattern_adjustments(name_lower, base_scores.copy())
+        
+        # Apply country multiplier to key parameters
+        for key in ['academic', 'graduate', 'roi', 'fsr']:
+            if key in adjusted_scores:
+                adjusted_scores[key] = min(
+                    self.parameters[key]['max'],
+                    adjusted_scores[key] * country_mult
+                )
+        
+        # Add meaningful variation based on university characteristics
+        varied_scores = self._add_meaningful_variation(name_lower, adjusted_scores)
+        
+        # Ensure scores are within bounds
+        final_scores = self._ensure_score_bounds(varied_scores)
+        
+        rounded_scores = {k: round(v, 1) for k, v in final_scores.items()}
+        logger.info(f"Estimated scores for {name}: {rounded_scores} (country mult: {country_mult})")
+        return rounded_scores
+    
+    def _get_base_scores_by_type(self, name_lower: str) -> Dict[str, float]:
+        """Get base scores based on university type"""
+        uni_type = self.classify_university_type_by_name(name_lower)
+        
+        # Base scores by type
+        type_base_scores = {
+            'RESEARCH_UNIVERSITY': {
+                'academic': 18.0, 'graduate': 17.0, 'roi': 15.0,
+                'fsr': 11.0, 'transparency': 8.0, 'visibility': 4.0
+            },
+            'TEACHING_UNIVERSITY': {
+                'academic': 12.0, 'graduate': 15.0, 'roi': 14.0,
+                'fsr': 11.0, 'transparency': 7.0, 'visibility': 3.0
+            },
+            'COLLEGE_POLYTECHNIC': {
+                'academic': 6.0, 'graduate': 16.0, 'roi': 16.0,
+                'fsr': 10.0, 'transparency': 6.0, 'visibility': 2.0
+            },
+            'APPLIED_UNIVERSITY': {
+                'academic': 10.0, 'graduate': 18.0, 'roi': 17.0,
+                'fsr': 11.0, 'transparency': 7.0, 'visibility': 3.0
+            },
+            'SPECIALIST_SCHOOL': {
+                'academic': 14.0, 'graduate': 19.0, 'roi': 16.0,
+                'fsr': 11.0, 'transparency': 7.0, 'visibility': 3.0
+            }
+        }
+        
+        return type_base_scores.get(uni_type, type_base_scores['TEACHING_UNIVERSITY'])
     
     def classify_university_type(self, name: str) -> str:
         """Classify university based on name patterns"""
@@ -1122,83 +1245,154 @@ class UniversityRankingSystem:
         logger.debug(f"Generated {len(rationale)} rationale points for {param_code}")
         return rationale
     
-    def estimate_scores(self, name: str, country: str) -> Dict[str, float]:
-        """Estimate scores for unknown universities"""
-        logger.info(f"Estimating scores for {name} in {country}")
-        name_lower = name.lower()
-        country_upper = country.upper() if country else "GLOBAL"
-        
-        # Base scores
-        scores = {
-            'academic': 12.0,
-            'graduate': 15.0,
-            'roi': 14.0,
-            'fsr': 11.0,
-            'transparency': 7.0,
-            'visibility': 3.0
-        }
-        
-        # Adjust based on name patterns
-        if 'mit' in name_lower or 'massachusetts institute' in name_lower:
-            scores = {'academic': 24, 'graduate': 23, 'roi': 22, 
-                     'fsr': 14, 'transparency': 9, 'visibility': 5}
-            logger.debug(f"Using MIT pattern scores for {name}")
-        elif 'harvard' in name_lower:
-            scores = {'academic': 25, 'graduate': 24, 'roi': 20, 
-                     'fsr': 13, 'transparency': 10, 'visibility': 5}
-            logger.debug(f"Using Harvard pattern scores for {name}")
-        elif 'stanford' in name_lower:
-            scores = {'academic': 24, 'graduate': 23, 'roi': 21, 
-                     'fsr': 14, 'transparency': 9, 'visibility': 5}
-            logger.debug(f"Using Stanford pattern scores for {name}")
-        elif 'oxford' in name_lower or 'cambridge' in name_lower:
-            scores = {'academic': 25, 'graduate': 24, 'roi': 19, 
-                     'fsr': 14, 'transparency': 10, 'visibility': 5}
-            logger.debug(f"Using Oxford/Cambridge pattern scores for {name}")
-        elif 'university' in name_lower and 'state' in name_lower:
-            scores.update({'academic': 15.0, 'roi': 16.0, 'transparency': 9.0, 'visibility': 4.0})
-            logger.debug(f"Using state university pattern scores for {name}")
-        elif 'university' in name_lower:
-            scores.update({'academic': 18.0, 'visibility': 4.0, 'transparency': 8.0})
-            logger.debug(f"Using general university pattern scores for {name}")
-        elif 'college' in name_lower:
-            scores.update({'graduate': 17.0, 'roi': 16.0, 'fsr': 12.0, 'academic': 8.0})
-            logger.debug(f"Using college pattern scores for {name}")
-        else:
-            logger.debug(f"Using base scores for {name}")
-        
-        # Apply country multiplier
-        if country_upper != "GLOBAL":
-            country_mult = self.country_multipliers.get(country_upper, 1.0)
-            logger.debug(f"Applying country multiplier {country_mult} for {country}")
-            for key in ['academic', 'graduate', 'roi', 'fsr']:
-                scores[key] = min(self.parameters[key]['max'], scores[key] * country_mult)
-        
-        # Add randomness for estimation error
-        for key in scores:
-            if key in ['transparency', 'visibility']:
-                variation = np.random.uniform(-0.5, 0.5)
+    def classify_university_type_by_name(self, name_lower: str) -> str:
+        """Classify university type based on name patterns - ENHANCED"""
+        if any(word in name_lower for word in ['business school', 'medical school', 'law school', 
+                                              'dental school', 'nursing school', 'art school']):
+            return 'SPECIALIST_SCHOOL'
+        elif any(word in name_lower for word in ['community college', 'technical college', 
+                                                'vocational college', 'career college']):
+            return 'COLLEGE_POLYTECHNIC'
+        elif any(word in name_lower for word in ['college', 'polytechnic', 'institute of technology']):
+            return 'COLLEGE_POLYTECHNIC'
+        elif any(word in name_lower for word in ['technical', 'applied', 'technology', 'engineering']):
+            if 'university' in name_lower:
+                return 'APPLIED_UNIVERSITY'
             else:
-                variation = np.random.uniform(-2.0, 2.0)
-            scores[key] = max(0, min(self.parameters[key]['max'], scores[key] + variation))
+                return 'COLLEGE_POLYTECHNIC'
+        elif 'university' in name_lower:
+            if any(word in name_lower for word in ['research', 'institute', 'tech', 'polytechnic', 
+                                                  'state', 'national', 'federal']):
+                return 'RESEARCH_UNIVERSITY'
+            else:
+                return 'TEACHING_UNIVERSITY'
+        else:
+            return 'TEACHING_UNIVERSITY'
+    
+    def _get_country_multiplier(self, country_upper: str) -> float:
+        """Get country multiplier with fallback"""
+        # Try exact match
+        if country_upper in self.country_multipliers:
+            return self.country_multipliers[country_upper]
         
-        rounded_scores = {k: round(v, 1) for k, v in scores.items()}
-        logger.info(f"Estimated scores for {name}: {rounded_scores}")
-        return rounded_scores
+        # Try partial matches
+        for known_country, multiplier in self.country_multipliers.items():
+            if country_upper in known_country or known_country in country_upper:
+                return multiplier
+        
+        # Default for unknown countries
+        return 1.0
+    
+    def _apply_name_pattern_adjustments(self, name_lower: str, scores: Dict[str, float]) -> Dict[str, float]:
+        """Apply adjustments based on specific name patterns"""
+        # World-class universities
+        if any(pattern in name_lower for pattern in [
+            'harvard', 'stanford', 'mit', 'massachusetts institute', 
+            'oxford', 'cambridge', 'caltech', 'princeton', 'yale'
+        ]):
+            scores.update({
+                'academic': 25, 'graduate': 24, 'roi': 22,
+                'fsr': 14, 'transparency': 10, 'visibility': 5
+            })
+        
+        # Ivy League and elite universities
+        elif any(pattern in name_lower for pattern in [
+            'columbia', 'cornell', 'dartmouth', 'brown', 'upenn',
+            'imperial college', 'university college london', 'eth zurich'
+        ]):
+            scores.update({
+                'academic': 24, 'graduate': 23, 'roi': 21,
+                'fsr': 13, 'transparency': 9, 'visibility': 5
+            })
+        
+        # Top public universities
+        elif any(pattern in name_lower for pattern in [
+            'university of california', 'ucla', 'uc berkeley', 'umich',
+            'university of michigan', 'university of texas', 'ut austin'
+        ]):
+            scores.update({
+                'academic': 22, 'graduate': 21, 'roi': 19,
+                'fsr': 12, 'transparency': 8, 'visibility': 4
+            })
+        
+        # State universities
+        elif 'state university' in name_lower or 'state uni' in name_lower:
+            scores.update({
+                'academic': scores.get('academic', 0) + 3,
+                'roi': scores.get('roi', 0) + 2,
+                'transparency': scores.get('transparency', 0) + 1,
+                'visibility': scores.get('visibility', 0) + 1
+            })
+        
+        # Private universities (not elite)
+        elif 'university' in name_lower and 'state' not in name_lower:
+            scores.update({
+                'academic': scores.get('academic', 0) + 2,
+                'visibility': scores.get('visibility', 0) + 1
+            })
+        
+        # Colleges with "university" in name (small liberal arts)
+        elif 'college' in name_lower and 'university' not in name_lower:
+            scores.update({
+                'graduate': scores.get('graduate', 0) + 3,
+                'roi': scores.get('roi', 0) + 2,
+                'fsr': scores.get('fsr', 0) + 2
+            })
+        
+        # International/foreign in name
+        elif any(word in name_lower for word in ['international', 'global', 'world']):
+            scores.update({
+                'visibility': scores.get('visibility', 0) + 1,
+                'transparency': scores.get('transparency', 0) + 1
+            })
+        
+        return scores
+    
+    def _add_meaningful_variation(self, name_lower: str, scores: Dict[str, float]) -> Dict[str, float]:
+        """Add meaningful variation based on university characteristics"""
+        import hashlib
+        
+        # Use name hash to generate reproducible but varied scores
+        name_hash = hashlib.md5(name_lower.encode()).hexdigest()
+        hash_int = int(name_hash[:8], 16)
+        
+        variations = {}
+        for i, (key, value) in enumerate(scores.items()):
+            # Use different parts of hash for different parameters
+            hash_part = (hash_int >> (i * 4)) & 0xF  # Get 4 bits for this parameter
+            
+            # Convert to variation between -3 and +3
+            variation = ((hash_part / 15.0) * 6.0) - 3.0
+            
+            # Different parameters have different variation ranges
+            if key in ['academic', 'graduate']:
+                variation *= 1.5  # More variation for major parameters
+            elif key in ['transparency', 'visibility']:
+                variation *= 0.5  # Less variation for minor parameters
+            
+            variations[key] = value + variation
+        
+        return variations
+    
+    def _ensure_score_bounds(self, scores: Dict[str, float]) -> Dict[str, float]:
+        """Ensure all scores are within valid bounds"""
+        bounded_scores = {}
+        for key, value in scores.items():
+            max_score = self.parameters.get(key, {}).get('max', 0)
+            bounded_scores[key] = max(0, min(max_score, value))
+        return bounded_scores
     
     def calculate_composite_score(self, scores: Dict[str, float]) -> float:
-        """Calculate composite score"""
-        composite = round(sum(scores.values()), 1)
-        logger.debug(f"Calculated composite score: {composite}")
-        return composite
+        """Calculate composite score - FIXED rounding"""
+        composite = sum(scores.values())
+        # Round to 1 decimal place
+        return round(composite, 1)
     
     def get_tier(self, score: float) -> Tuple[str, str]:
         """Determine tier and description"""
         for tier, (low, high, description) in self.tiers.items():
             if low <= score <= high:
-                logger.debug(f"Score {score} falls in tier {tier}: {description}")
                 return tier, description
-        logger.debug(f"Score {score} falls in default tier D")
         return 'D', self.tiers['D'][2]
     
     def calculate_error_margin(self, university_name: str, country: str, data_sources_used: List[str] = None) -> float:
