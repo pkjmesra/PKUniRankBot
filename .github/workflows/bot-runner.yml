@@ -44,7 +44,7 @@ jobs:
         head -n 1 .env.dev | sed 's/./*/g'  # Hide token in logs
 
     - name: Start bot daemon
-      timeout-minutes: 350
+      timeout-minutes: 58
       run: |
         echo "Starting Telegram Bot as a background process..."
         
@@ -91,7 +91,7 @@ jobs:
         
         # Keep the action running (adjust timeout as needed)
         echo "Bot will run for 10 minutes..."
-        sleep 21000
+        sleep 3500
         
       continue-on-error: true
 
