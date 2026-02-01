@@ -9,3 +9,5 @@ wikipedia==1.4.0
 googlesearch-python==1.2.3
 beautifulsoup4==4.12.2
 lxml==4.9.3
+flask 
+twilio
