@@ -1,11 +1,35 @@
 """
+The MIT License (MIT)
+
+Copyright (c) 2023 pkjmesra
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+"""
+"""
 pkUniRankBot - Telegram Bot for University Ranking
 Compatible with python-telegram-bot v13.15 (Updater architecture)
 """
 
 import os
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass
 from datetime import datetime
 import numpy as np
@@ -42,6 +66,8 @@ class UniversityData:
     tier: str
     error_margin: float
     timestamp: str
+    rationale: Dict[str, List[str]] = None
+    sources: List[str] = None
 
 class UniversityRankingSystem:
     def __init__(self):
@@ -65,7 +91,7 @@ class UniversityRankingSystem:
             'D': (0, 44.999, "🚨 POOR")
         }
         
-        # Database of known universities
+        # Database of known universities with rationale
         self.university_db = self.load_university_database()
         
         # Country quality multipliers
@@ -77,86 +103,201 @@ class UniversityRankingSystem:
             'China': 0.9, 'India': 0.85, 'Brazil': 0.85,
             'Russia': 0.85, 'South Africa': 0.85
         }
+        
+        # Parameter rationale templates
+        self.parameter_rationale_templates = {
+            'academic': [
+                "Based on research output and citations",
+                "Academic reputation from surveys",
+                "Faculty qualifications and awards",
+                "Research funding and grants",
+                "Publication quality in indexed journals"
+            ],
+            'graduate': [
+                "Employment rate within 6 months of graduation",
+                "Average starting salary of graduates",
+                "Employer satisfaction surveys",
+                "Career services effectiveness",
+                "Alumni network strength"
+            ],
+            'roi': [
+                "Return on Investment calculation",
+                "Tuition fees relative to earning potential",
+                "Financial aid availability",
+                "Scholarship opportunities",
+                "Cost of living considerations"
+            ],
+            'fsr': [
+                "Student to faculty ratio",
+                "Average class sizes",
+                "Faculty availability for mentorship",
+                "Teaching quality indicators",
+                "Student support services"
+            ],
+            'transparency': [
+                "Accreditation status",
+                "Data availability and reporting",
+                "Institutional recognition",
+                "Quality assurance processes",
+                "Governance transparency"
+            ],
+            'visibility': [
+                "Web presence and digital footprint",
+                "International recognition",
+                "Brand strength and reputation",
+                "Social media engagement",
+                "Media mentions and coverage"
+            ]
+        }
+        
+        # Common data sources
+        self.common_sources = [
+            "QS World University Rankings",
+            "Times Higher Education (THE)",
+            "Academic Ranking of World Universities (ARWU)",
+            "U.S. News & World Report",
+            "Forbes College Rankings",
+            "National Center for Education Statistics",
+            "Institutional websites and reports",
+            "Government education databases",
+            "Employer surveys and reports",
+            "Alumni outcome surveys"
+        ]
     
     def load_university_database(self) -> Dict:
-        """Load university database with pre-calculated scores"""
+        """Load university database with pre-calculated scores and rationale"""
         return {
             'bryant university': {
                 'country': 'USA',
                 'type': 'TEACHING_UNIVERSITY',
                 'scores': {'academic': 12, 'graduate': 22, 'roi': 16, 
                           'fsr': 13, 'transparency': 8, 'visibility': 3},
-                'description': 'Private business-focused university'
+                'description': 'Private business-focused university',
+                'rationale': {
+                    'academic': ['Strong business program focus', 'Limited research output'],
+                    'graduate': ['High business placement rate', 'Strong corporate partnerships'],
+                    'roi': ['Competitive tuition for business education', 'Good salary outcomes']
+                }
             },
             'massachusetts institute of technology': {
                 'country': 'USA',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 24, 'graduate': 23, 'roi': 22, 
                           'fsr': 14, 'transparency': 9, 'visibility': 5},
-                'description': 'World-renowned research university'
+                'description': 'World-renowned research university',
+                'rationale': {
+                    'academic': ['Top research output globally', 'Nobel laureate faculty'],
+                    'graduate': ['Highly sought after by employers', 'Exceptional starting salaries'],
+                    'roi': ['High earning potential offsets cost', 'Strong financial aid']
+                }
             },
             'harvard university': {
                 'country': 'USA',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 25, 'graduate': 24, 'roi': 20, 
                           'fsr': 13, 'transparency': 10, 'visibility': 5},
-                'description': 'Ivy League research university'
+                'description': 'Ivy League research university',
+                'rationale': {
+                    'academic': ['World-leading research institution', 'Extensive library resources'],
+                    'graduate': ['Exceptional career outcomes', 'Powerful alumni network'],
+                    'roi': ['Premium brand value', 'Generous financial aid programs']
+                }
             },
             'stanford university': {
                 'country': 'USA',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 24, 'graduate': 23, 'roi': 21, 
                           'fsr': 14, 'transparency': 9, 'visibility': 5},
-                'description': 'Leading research university'
+                'description': 'Leading research university',
+                'rationale': {
+                    'academic': ['Silicon Valley research hub', 'Innovation-focused programs'],
+                    'graduate': ['Strong tech industry placement', 'Entrepreneurship support'],
+                    'roi': ['High tech industry salaries', 'Startup success stories']
+                }
             },
             'university of toronto': {
                 'country': 'Canada',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 22, 'graduate': 21, 'roi': 18, 
                           'fsr': 13, 'transparency': 9, 'visibility': 4},
-                'description': 'Top Canadian research university'
+                'description': 'Top Canadian research university',
+                'rationale': {
+                    'academic': ['Leading Canadian research output', 'Strong international collaborations'],
+                    'graduate': ['Good employment outcomes in Canada', 'Strong professional networks'],
+                    'roi': ['Lower cost than US peers', 'Good Canadian job market access']
+                }
             },
             'university of oxford': {
                 'country': 'UK',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 25, 'graduate': 24, 'roi': 19, 
                           'fsr': 14, 'transparency': 10, 'visibility': 5},
-                'description': 'Historic research university'
+                'description': 'Historic research university',
+                'rationale': {
+                    'academic': ['Centuries of academic tradition', 'World-class research facilities'],
+                    'graduate': ['Excellent global employment prospects', 'Prestigious alumni network'],
+                    'roi': ['International brand recognition', 'Strong scholarship programs']
+                }
             },
             'conestoga college': {
                 'country': 'Canada',
                 'type': 'COLLEGE_POLYTECHNIC',
                 'scores': {'academic': 4.0, 'graduate': 20.0, 'roi': 17.5, 
                           'fsr': 12.5, 'transparency': 6.5, 'visibility': 3.5},
-                'description': 'Canadian polytechnic institute'
+                'description': 'Canadian polytechnic institute',
+                'rationale': {
+                    'academic': ['Applied learning focus', 'Limited research scope'],
+                    'graduate': ['Strong industry partnerships', 'Practical skill development'],
+                    'roi': ['Affordable tuition', 'Quick entry to workforce']
+                }
             },
             'algonquin college': {
                 'country': 'Canada',
                 'type': 'COLLEGE_POLYTECHNIC',
                 'scores': {'academic': 3.5, 'graduate': 19.0, 'roi': 17.0, 
                           'fsr': 12.0, 'transparency': 6.0, 'visibility': 3.0},
-                'description': 'Canadian college'
+                'description': 'Canadian college',
+                'rationale': {
+                    'academic': ['Vocational education focus', 'Certificate/diploma programs'],
+                    'graduate': ['Industry-relevant training', 'Local employment focus'],
+                    'roi': ['Cost-effective education', 'Short program duration']
+                }
             },
             'north dakota state university': {
                 'country': 'USA',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 15.6, 'graduate': 15.0, 'roi': 16.1, 
                           'fsr': 11.0, 'transparency': 9.0, 'visibility': 4.0},
-                'description': 'Public research university'
+                'description': 'Public research university',
+                'rationale': {
+                    'academic': ['Regional research strength', 'Specialized programs'],
+                    'graduate': ['Strong regional employment', 'Industry connections'],
+                    'roi': ['Public university affordability', 'Good value education']
+                }
             },
             'university of tokyo': {
                 'country': 'Japan',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 23, 'graduate': 21, 'roi': 18, 
                           'fsr': 13, 'transparency': 8, 'visibility': 4},
-                'description': 'Top Japanese university'
+                'description': 'Top Japanese university',
+                'rationale': {
+                    'academic': ['Leading Asian research institution', 'Strong STEM programs'],
+                    'graduate': ['Excellent domestic employment', 'Corporate Japan connections'],
+                    'roi': ['Subsidized tuition in Japan', 'Strong Japanese economy']
+                }
             },
             'university of sydney': {
                 'country': 'Australia',
                 'type': 'RESEARCH_UNIVERSITY',
                 'scores': {'academic': 21, 'graduate': 20, 'roi': 17, 
                           'fsr': 12, 'transparency': 8, 'visibility': 4},
-                'description': 'Australian research university'
+                'description': 'Australian research university',
+                'rationale': {
+                    'academic': ['Strong research in Australia', 'International student focus'],
+                    'graduate': ['Good Australia/NZ employment', 'Asia-Pacific opportunities'],
+                    'roi': ['International student market', 'Strong Australian education brand']
+                }
             }
         }
     
@@ -177,6 +318,44 @@ class UniversityRankingSystem:
                 return 'TEACHING_UNIVERSITY'
         
         return 'TEACHING_UNIVERSITY'
+    
+    def generate_rationale_for_score(self, param_code: str, score: float, max_score: float, 
+                                   university_name: str, country: str, is_estimated: bool) -> List[str]:
+        """Generate rationale for a parameter score"""
+        rationale = []
+        percentage = (score / max_score * 100) if max_score > 0 else 0
+        
+        # Get base rationale templates
+        base_rationale = self.parameter_rationale_templates.get(param_code, [])
+        
+        # Add score-specific rationale
+        if percentage >= 80:
+            rationale.append(f"Excellent performance ({percentage:.1f}% of max)")
+            rationale.append("Exceeds international benchmarks")
+        elif percentage >= 60:
+            rationale.append(f"Good performance ({percentage:.1f}% of max)")
+            rationale.append("Meets or exceeds most standards")
+        elif percentage >= 40:
+            rationale.append(f"Average performance ({percentage:.1f}% of max)")
+            rationale.append("Room for improvement in some areas")
+        else:
+            rationale.append(f"Below average performance ({percentage:.1f}% of max)")
+            rationale.append("Significant improvement needed")
+        
+        # Add estimation note if applicable
+        if is_estimated:
+            rationale.append("Score based on pattern analysis and estimation")
+            rationale.append("Actual performance may vary")
+        
+        # Add country context
+        if country:
+            rationale.append(f"Context: {country} higher education system")
+        
+        # Add university type context
+        uni_type = self.classify_university_type(university_name)
+        rationale.append(f"Institution type: {uni_type.replace('_', ' ').title()}")
+        
+        return rationale
     
     def estimate_scores(self, name: str, country: str) -> Dict[str, float]:
         """Estimate scores for unknown universities"""
@@ -260,9 +439,34 @@ class UniversityRankingSystem:
             
             return round(min(15.0, max(3.0, base_error + np.random.uniform(-2.0, 2.0))), 1)
     
+    def get_sources_for_university(self, university_name: str, is_estimated: bool) -> List[str]:
+        """Get data sources for university ranking"""
+        sources = []
+        
+        if not is_estimated:
+            sources.extend([
+                "Institutional annual reports",
+                "Accreditation agency data",
+                "Government education statistics",
+                "International ranking databases"
+            ])
+        else:
+            sources.extend([
+                "Pattern analysis of similar institutions",
+                "Country education system benchmarks",
+                "Institution type averages",
+                "Statistical estimation models"
+            ])
+        
+        # Add common sources
+        sources.extend(self.common_sources[:4])
+        
+        return sources
+    
     def rank_university(self, university_name: str, country: str = "") -> UniversityData:
         """Main ranking function"""
         name_lower = university_name.lower()
+        is_estimated = name_lower not in self.university_db
         
         # Check database first
         if name_lower in self.university_db:
@@ -270,11 +474,27 @@ class UniversityRankingSystem:
             scores = data['scores']
             university_type = data['type']
             db_country = data['country']
+            db_rationale = data.get('rationale', {})
         else:
             # Estimate scores
             scores = self.estimate_scores(university_name, country)
             university_type = self.classify_university_type(university_name)
             db_country = country if country else "Global"
+            db_rationale = {}
+        
+        # Generate rationale for each parameter
+        rationale = {}
+        for param_code, score in scores.items():
+            max_score = self.parameters[param_code]['max']
+            if param_code in db_rationale:
+                rationale[param_code] = db_rationale[param_code]
+            else:
+                rationale[param_code] = self.generate_rationale_for_score(
+                    param_code, score, max_score, university_name, db_country, is_estimated
+                )
+        
+        # Get data sources
+        sources = self.get_sources_for_university(university_name, is_estimated)
         
         # Calculate metrics
         composite = self.calculate_composite_score(scores)
@@ -289,7 +509,9 @@ class UniversityRankingSystem:
             composite=composite,
             tier=tier,
             error_margin=error_margin,
-            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            rationale=rationale,
+            sources=sources
         )
 
 class UniRankBot:
@@ -298,6 +520,9 @@ class UniRankBot:
         self.updater = Updater(token=token, use_context=True)
         self.dispatcher = self.updater.dispatcher
         self.ranking_system = UniversityRankingSystem()
+        
+        # Store current ranking data for rationale viewing
+        self.user_ranking_data = {}
         
         # Set up handlers
         self.setup_handlers()
@@ -403,8 +628,8 @@ D (0-44): Poor
 /parameters - View parameter details
 /help - This help message
 
-*Example usage:*
-Send /rank and follow the prompts
+*New Feature:*
+View rationale for each parameter score and composite score sources!
         """
         
         update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
@@ -478,7 +703,7 @@ Institutional web presence, brand recognition.
                 university_name = parts[0]
                 country = ""
             
-            self.perform_ranking(update, university_name, country)
+            self.perform_ranking(update, university_name, country, context)
         else:
             # Start interactive ranking
             self.start_ranking(update, context)
@@ -521,7 +746,7 @@ Institutional web presence, brand recognition.
         university_name = context.user_data.get('university_name', '')
         country = update.message.text.strip()
         
-        self.perform_ranking(update, university_name, country)
+        self.perform_ranking(update, university_name, country, context)
         return ConversationHandler.END
     
     def cancel_ranking(self, update: Update, context: CallbackContext):
@@ -538,7 +763,7 @@ Institutional web presence, brand recognition.
             parts = [p.strip() for p in message.split(',', 1)]
             if len(parts) == 2:
                 university_name, country = parts
-                self.perform_ranking(update, university_name, country)
+                self.perform_ranking(update, university_name, country, context)
                 return
         
         # Otherwise show help
@@ -562,7 +787,6 @@ Institutional web presence, brand recognition.
                 "🎓 *University Ranking*\n\nPlease enter the university name:",
                 parse_mode=ParseMode.MARKDOWN
             )
-            # Note: We can't start conversation from callback in this simple setup
             query.message.reply_text("Please use /rank command to start ranking.")
         
         elif data == "view_tiers":
@@ -594,8 +818,33 @@ Institutional web presence, brand recognition.
                     country = country_code
                 
                 self.perform_ranking_callback(query, university_name.replace('_', ' '), country)
+        
+        elif data.startswith("rationale_"):
+            # Handle rationale viewing
+            parts = data.split("_")
+            if len(parts) >= 3:
+                param_code = parts[1]
+                user_id = query.from_user.id
+                
+                if user_id in self.user_ranking_data:
+                    ranking_data = self.user_ranking_data[user_id]
+                    self.show_parameter_rationale(query, param_code, ranking_data)
+        
+        elif data == "view_all_rationales":
+            # Show all parameter rationales
+            user_id = query.from_user.id
+            if user_id in self.user_ranking_data:
+                ranking_data = self.user_ranking_data[user_id]
+                self.show_all_rationales(query, ranking_data)
+        
+        elif data == "view_sources":
+            # Show composite score sources
+            user_id = query.from_user.id
+            if user_id in self.user_ranking_data:
+                ranking_data = self.user_ranking_data[user_id]
+                self.show_sources(query, ranking_data)
     
-    def perform_ranking(self, update: Update, university_name: str, country: str):
+    def perform_ranking(self, update: Update, university_name: str, country: str, context: CallbackContext):
         """Perform ranking and send results"""
         processing_msg = update.message.reply_text(
             f"🔍 *Analyzing {university_name}...*\n\nPlease wait while I gather data...",
@@ -605,6 +854,10 @@ Institutional web presence, brand recognition.
         try:
             # Get ranking data
             ranking_data = self.ranking_system.rank_university(university_name, country)
+            
+            # Store ranking data for rationale viewing
+            user_id = update.effective_user.id
+            self.user_ranking_data[user_id] = ranking_data
             
             # Format results
             results_text = self.format_ranking_results(ranking_data)
@@ -637,6 +890,10 @@ Institutional web presence, brand recognition.
             # Get ranking data
             ranking_data = self.ranking_system.rank_university(university_name, country)
             
+            # Store ranking data for rationale viewing
+            user_id = query.from_user.id
+            self.user_ranking_data[user_id] = ranking_data
+            
             # Format results
             results_text = self.format_ranking_results(ranking_data)
             
@@ -656,6 +913,146 @@ Institutional web presence, brand recognition.
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=self.get_error_keyboard()
             )
+    
+    def show_parameter_rationale(self, query, param_code: str, ranking_data: UniversityData):
+        """Show rationale for a specific parameter"""
+        param_info = self.ranking_system.parameters.get(param_code, {})
+        param_name = param_info.get('name', param_code)
+        score = ranking_data.scores.get(param_code, 0)
+        max_score = param_info.get('max', 1)
+        percentage = (score / max_score * 100) if max_score > 0 else 0
+        
+        # Get rationale
+        rationale_list = ranking_data.rationale.get(param_code, ["No rationale available"])
+        
+        # Format rationale text
+        rationale_text = f"""
+*📋 {param_name} - Score Rationale*
+*Score:* {score:.1f}/{max_score} ({percentage:.1f}%)
+
+*🔍 Rationale:*
+"""
+        
+        for i, item in enumerate(rationale_list, 1):
+            rationale_text += f"{i}. {item}\n"
+        
+        # Add back button
+        keyboard = [
+            [InlineKeyboardButton("🔙 Back to Results", callback_data=f"rationale_back_{param_code}")],
+            [InlineKeyboardButton("📊 View All Parameters", callback_data="view_all_rationales")],
+            [InlineKeyboardButton("📚 View Sources", callback_data="view_sources")],
+            [InlineKeyboardButton("🎯 Rank Another", callback_data="rank_another")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            rationale_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
+    
+    def show_all_rationales(self, query, ranking_data: UniversityData):
+        """Show all parameter rationales in one view"""
+        rationales_text = f"""
+*📊 All Parameter Rationales for {ranking_data.name}*
+*Composite Score:* {ranking_data.composite:.1f}/100
+*Tier:* {ranking_data.tier}
+
+"""
+        
+        for param_code, param_info in self.ranking_system.parameters.items():
+            score = ranking_data.scores.get(param_code, 0)
+            max_score = param_info['max']
+            percentage = (score / max_score * 100) if max_score > 0 else 0
+            
+            rationales_text += f"*{param_info['name']}*\n"
+            rationales_text += f"Score: {score:.1f}/{max_score} ({percentage:.1f}%)\n"
+            
+            # Show first 2 rationale points
+            rationale_list = ranking_data.rationale.get(param_code, [])
+            if rationale_list:
+                for i in range(min(2, len(rationale_list))):
+                    rationales_text += f"  • {rationale_list[i]}\n"
+            
+            rationales_text += "\n"
+        
+        rationales_text += "*💡 View detailed rationale for each parameter using the buttons below*"
+        
+        # Create parameter-specific buttons
+        keyboard = []
+        for param_code, param_info in self.ranking_system.parameters.items():
+            short_name = param_info['name'].split('&')[0].strip()
+            if len(short_name) > 15:
+                short_name = short_name[:13] + ".."
+            keyboard.append([InlineKeyboardButton(
+                f"🔍 {short_name}",
+                callback_data=f"rationale_{param_code}"
+            )])
+        
+        keyboard.append([
+            InlineKeyboardButton("📚 View Sources", callback_data="view_sources"),
+            InlineKeyboardButton("🔙 Back to Results", callback_data="view_all_back")
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            rationales_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
+    
+    def show_sources(self, query, ranking_data: UniversityData):
+        """Show data sources for composite score"""
+        sources_text = f"""
+*📚 Data Sources & Methodology for {ranking_data.name}*
+
+*Composite Score Calculation:*
+Sum of all parameter scores (max 100 points)
+
+*Parameter Weighting:*
+Academic Reputation & Research: 25%
+Graduate Prospects: 25%
+ROI / Affordability: 20%
+Faculty-Student Ratio: 15%
+Transparency & Recognition: 10%
+Visibility & Presence: 5%
+
+*Data Sources Used:*
+"""
+        
+        for i, source in enumerate(ranking_data.sources, 1):
+            sources_text += f"{i}. {source}\n"
+        
+        # Add confidence information
+        if ranking_data.error_margin <= 3:
+            confidence = "High"
+            sources_text += f"\n*🔍 Data Confidence:* {confidence}\n"
+            sources_text += "*📊 Note:* Based on verified institutional data\n"
+        elif ranking_data.error_margin <= 7:
+            confidence = "Moderate"
+            sources_text += f"\n*🔍 Data Confidence:* {confidence}\n"
+            sources_text += "*📊 Note:* Based on estimation with reliable proxies\n"
+        else:
+            confidence = "Low"
+            sources_text += f"\n*🔍 Data Confidence:* {confidence}\n"
+            sources_text += "*📊 Note:* Based on statistical estimation and patterns\n"
+        
+        sources_text += f"*📈 Error Margin:* ±{ranking_data.error_margin} points\n"
+        
+        # Add back button
+        keyboard = [
+            [InlineKeyboardButton("🔙 Back to Results", callback_data="sources_back")],
+            [InlineKeyboardButton("📊 View All Rationales", callback_data="view_all_rationales")],
+            [InlineKeyboardButton("🎯 Rank Another", callback_data="rank_another")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        query.edit_message_text(
+            sources_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
     
     def show_tiers(self, query):
         """Show tiers information"""
@@ -824,14 +1221,24 @@ Click the buttons below to get started!
         elif data.tier in ['C', 'D']:
             results += "• Urgent improvement needed\n• Focus on core competencies\n• Seek accreditation\n"
         
+        # Add rationale prompt
+        results += "\n*🔍 Want to see the rationale behind each score?*\n"
+        results += "Use the buttons below to explore parameter rationales and data sources!"
+        
         return results
     
     def get_results_keyboard(self):
-        """Get keyboard for results message"""
+        """Get keyboard for results message with rationale options"""
         keyboard = [
+            [
+                InlineKeyboardButton("📋 View All Rationales", callback_data="view_all_rationales"),
+                InlineKeyboardButton("📚 View Sources", callback_data="view_sources")
+            ],
             [InlineKeyboardButton("🎯 Rank Another University", callback_data="rank_another")],
-            [InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers")],
-            [InlineKeyboardButton("📈 View Parameters", callback_data="view_parameters")],
+            [
+                InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers"),
+                InlineKeyboardButton("📈 View Parameters", callback_data="view_parameters")
+            ],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)

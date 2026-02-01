@@ -1,0 +1,102 @@
+name: Deploy Telegram Bot
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Create environment configuration
+      env:
+        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        # Add other environment variables if needed
+      run: |
+        echo "Creating .env.dev file..."
+        cat > .env.dev << EOF
+        BOT_TOKEN=${BOT_TOKEN}
+        # Add other environment variables here
+        # DEBUG_MODE=false
+        # LOG_LEVEL=INFO
+        EOF
+        echo "Environment file created"
+        # Verify file
+        ls -la .env.dev
+        echo "First line:"
+        head -n 1 .env.dev | sed 's/./*/g'  # Hide token in logs
+
+    - name: Start bot daemon
+      run: |
+        echo "Starting Telegram Bot as a background process..."
+        
+        # Create a startup script
+        cat > start_bot.sh << 'EOF'
+        #!/bin/bash
+        echo "Bot starting at $(date)"
+                
+        # Set up trap for graceful shutdown
+        cleanup() {
+            echo "Shutting down bot..."
+            pkill -f "python.*bot.py" 2>/dev/null || true
+            exit 0
+        }
+        trap cleanup SIGINT SIGTERM
+                
+        # Run the bot
+        python bot.py &
+                
+        # Keep the script running
+        wait
+        EOF
+                
+        chmod +x start_bot.sh
+        
+        # Run the bot with logging
+        nohup ./start_bot.sh > bot.log 2>&1 &
+        
+        echo "Bot started in background"
+        echo "Waiting 10 seconds to check if bot is running..."
+        sleep 10
+        
+        # Check if bot process is running
+        if pgrep -f "python.*bot.py" > /dev/null; then
+            echo "✅ Bot is running successfully!"
+            echo "Last 20 lines of log:"
+            tail -20 bot.log || true
+        else
+            echo "❌ Bot failed to start!"
+            echo "Full bot.log:"
+            cat bot.log || true
+            exit 1
+        fi
+        
+        # Keep the action running (adjust timeout as needed)
+        echo "Bot will run for 10 minutes..."
+        sleep 600
+        
+      continue-on-error: true
+
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "Cleaning up..."
+        # Stop any running bot processes
+        pkill -f "python.*bot.py" 2>/dev/null || true
+        # Remove environment file
+        rm -f .env.dev
+        rm -f bot.log
