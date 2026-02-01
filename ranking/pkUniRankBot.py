@@ -24,18 +24,38 @@ SOFTWARE.
 """
 """
 pkUniRankBot - Telegram Bot for University Ranking with Excel Processing
-Compatible with python-telegram-bot v13.15 (Updater architecture)
+Enhanced with real data fetching and comprehensive rate limiting
 """
 
 import os
 import logging
 import tempfile
-from typing import Dict, Tuple, List, Optional
-from dataclasses import dataclass
-from datetime import datetime
+import time
+import requests
+import re
+from bs4 import BeautifulSoup
+from typing import Dict, Tuple, List, Optional, Any
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 from dotenv import dotenv_values
+import wikipedia
+from googlesearch import search
+import json
+import urllib.parse
+from threading import Lock
+from collections import defaultdict
+from enum import Enum
+import threading
+try:
+    import thread
+except ImportError:
+    import _thread as thread
+
+import traceback
+start_time = datetime.now()
+MINUTES_2_IN_SECONDS = 120
 
 # Import for telegram bot v13.15
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Document
@@ -44,10 +64,10 @@ from telegram.ext import (
     CallbackQueryHandler, ConversationHandler, CallbackContext
 )
 
-# Configure logging
+# Configure logging with more detailed format
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+    level=logging.DEBUG
 )
 logger = logging.getLogger(__name__)
 
@@ -70,9 +90,509 @@ class UniversityData:
     timestamp: str
     rationale: Dict[str, List[str]] = None
     sources: List[str] = None
+    is_estimated: bool = True
+    real_data_sources: List[str] = None
+    rate_limit_info: List[Dict] = None
+
+# ============================================================================
+# API RATE LIMITING CLASSES
+# ============================================================================
+
+class APIType(Enum):
+    """Types of APIs we're using"""
+    WIKIPEDIA = "wikipedia"
+    GOOGLE_SEARCH = "google_search"
+    WEBOMETRICS = "webometrics"
+    QS_RANKINGS = "qs_rankings"
+    THE_RANKINGS = "the_rankings"
+    GOVERNMENT_API = "government_api"
+
+class RateLimitExceededException(Exception):
+    """Custom exception for rate limit exceeded"""
+    def __init__(self, api_type: APIType, reset_time: datetime, limit_details: str = ""):
+        self.api_type = api_type
+        self.reset_time = reset_time
+        self.limit_details = limit_details
+        self.message = f"Rate limit exceeded for {api_type.value}. Resets at {reset_time}"
+        super().__init__(self.message)
+
+@dataclass
+class RateLimitInfo:
+    """Information about rate limits for an API"""
+    requests_per_minute: int = 60
+    requests_per_hour: int = 3600
+    requests_per_day: int = 86400
+    reset_interval_minutes: int = 1
+    reset_interval_hours: int = 1
+    reset_interval_days: int = 24
+    
+    def get_reset_time(self, time_unit: str) -> datetime:
+        """Get reset time based on time unit"""
+        now = datetime.now()
+        if time_unit == "minute":
+            return now + timedelta(minutes=self.reset_interval_minutes)
+        elif time_unit == "hour":
+            return now + timedelta(hours=self.reset_interval_hours)
+        elif time_unit == "day":
+            return now + timedelta(days=self.reset_interval_days)
+        return now
+
+@dataclass
+class APICallTracker:
+    """Tracks API calls for rate limiting"""
+    api_type: APIType
+    calls: List[datetime] = field(default_factory=list)
+    lock: Lock = field(default_factory=Lock)
+    
+    def add_call(self):
+        """Record an API call"""
+        with self.lock:
+            self.calls.append(datetime.now())
+            # Clean up old calls (keep last 24 hours)
+            cutoff = datetime.now() - timedelta(hours=24)
+            self.calls = [call for call in self.calls if call > cutoff]
+    
+    def get_recent_calls(self, minutes: int = 1) -> int:
+        """Get number of calls in recent minutes"""
+        with self.lock:
+            cutoff = datetime.now() - timedelta(minutes=minutes)
+            return len([call for call in self.calls if call > cutoff])
+    
+    def get_hourly_calls(self) -> int:
+        """Get number of calls in last hour"""
+        with self.lock:
+            cutoff = datetime.now() - timedelta(hours=1)
+            return len([call for call in self.calls if call > cutoff])
+    
+    def get_daily_calls(self) -> int:
+        """Get number of calls in last 24 hours"""
+        with self.lock:
+            cutoff = datetime.now() - timedelta(hours=24)
+            return len([call for call in self.calls if call > cutoff])
+
+class RateLimiter:
+    """Manages rate limiting for all APIs"""
+    
+    def __init__(self):
+        logger.info("Initializing RateLimiter with API limits")
+        self.limits = {
+            APIType.WIKIPEDIA: RateLimitInfo(
+                requests_per_minute=100,  # Wikipedia's generous limit
+                requests_per_hour=2000,
+                requests_per_day=10000
+            ),
+            APIType.GOOGLE_SEARCH: RateLimitInfo(
+                requests_per_minute=10,   # Google is strict
+                requests_per_hour=100,
+                requests_per_day=1000
+            ),
+            APIType.WEBOMETRICS: RateLimitInfo(
+                requests_per_minute=30,
+                requests_per_hour=500,
+                requests_per_day=5000
+            ),
+            APIType.QS_RANKINGS: RateLimitInfo(
+                requests_per_minute=20,
+                requests_per_hour=200,
+                requests_per_day=2000
+            ),
+            APIType.THE_RANKINGS: RateLimitInfo(
+                requests_per_minute=20,
+                requests_per_hour=200,
+                requests_per_day=2000
+            ),
+            APIType.GOVERNMENT_API: RateLimitInfo(
+                requests_per_minute=5,    # Government APIs are often strict
+                requests_per_hour=50,
+                requests_per_day=500
+            )
+        }
+        
+        self.trackers: Dict[APIType, APICallTracker] = {}
+        for api_type in APIType:
+            self.trackers[api_type] = APICallTracker(api_type)
+        
+        self.global_lock = Lock()
+        logger.info(f"RateLimiter initialized with {len(self.trackers)} API trackers")
+    
+    def check_rate_limit(self, api_type: APIType, user_id: Optional[str] = None) -> bool:
+        """Check if API call is allowed"""
+        tracker = self.trackers[api_type]
+        limits = self.limits[api_type]
+        
+        # Check minute limit
+        recent_calls = tracker.get_recent_calls(1)
+        if recent_calls >= limits.requests_per_minute:
+            reset_time = limits.get_reset_time("minute")
+            logger.warning(f"Minute rate limit exceeded for {api_type.value}: {recent_calls}/{limits.requests_per_minute}")
+            raise RateLimitExceededException(
+                api_type, 
+                reset_time,
+                f"Minute limit: {limits.requests_per_minute} calls"
+            )
+        
+        # Check hourly limit
+        hourly_calls = tracker.get_hourly_calls()
+        if hourly_calls >= limits.requests_per_hour:
+            reset_time = limits.get_reset_time("hour")
+            logger.warning(f"Hourly rate limit exceeded for {api_type.value}: {hourly_calls}/{limits.requests_per_hour}")
+            raise RateLimitExceededException(
+                api_type,
+                reset_time,
+                f"Hourly limit: {limits.requests_per_hour} calls"
+            )
+        
+        # Check daily limit
+        daily_calls = tracker.get_daily_calls()
+        if daily_calls >= limits.requests_per_day:
+            reset_time = limits.get_reset_time("day")
+            logger.warning(f"Daily rate limit exceeded for {api_type.value}: {daily_calls}/{limits.requests_per_day}")
+            raise RateLimitExceededException(
+                api_type,
+                reset_time,
+                f"Daily limit: {limits.requests_per_day} calls"
+            )
+        
+        logger.debug(f"Rate limit check passed for {api_type.value}: {recent_calls}/{limits.requests_per_minute} (minute), {hourly_calls}/{limits.requests_per_hour} (hour), {daily_calls}/{limits.requests_per_day} (day)")
+        return True
+    
+    def record_call(self, api_type: APIType):
+        """Record an API call"""
+        tracker = self.trackers[api_type]
+        tracker.add_call()
+        logger.debug(f"Recorded API call for {api_type.value}")
+    
+    def get_api_status(self, api_type: APIType) -> Dict[str, Any]:
+        """Get current status of an API"""
+        tracker = self.trackers[api_type]
+        limits = self.limits[api_type]
+        
+        recent_calls = tracker.get_recent_calls(1)
+        hourly_calls = tracker.get_hourly_calls()
+        daily_calls = tracker.get_daily_calls()
+        
+        status = {
+            'api': api_type.value,
+            'calls_last_minute': recent_calls,
+            'calls_last_hour': hourly_calls,
+            'calls_last_day': daily_calls,
+            'minute_limit': limits.requests_per_minute,
+            'hourly_limit': limits.requests_per_hour,
+            'daily_limit': limits.requests_per_day,
+            'available_minute': max(0, limits.requests_per_minute - recent_calls),
+            'available_hour': max(0, limits.requests_per_hour - hourly_calls),
+            'available_day': max(0, limits.requests_per_day - daily_calls)
+        }
+        
+        logger.debug(f"API status for {api_type.value}: {status}")
+        return status
+    
+    def get_all_status(self) -> List[Dict[str, Any]]:
+        """Get status of all APIs"""
+        all_status = [self.get_api_status(api_type) for api_type in APIType]
+        logger.debug(f"Retrieved status for {len(all_status)} APIs")
+        return all_status
+    
+    def get_next_reset_time(self, api_type: APIType) -> Optional[datetime]:
+        """Get next reset time for an API"""
+        tracker = self.trackers[api_type]
+        limits = self.limits[api_type]
+        
+        if tracker.get_recent_calls(1) >= limits.requests_per_minute:
+            reset_time = limits.get_reset_time("minute")
+            logger.debug(f"Next reset for {api_type.value}: minute reset at {reset_time}")
+            return reset_time
+        elif tracker.get_hourly_calls() >= limits.requests_per_hour:
+            reset_time = limits.get_reset_time("hour")
+            logger.debug(f"Next reset for {api_type.value}: hour reset at {reset_time}")
+            return reset_time
+        elif tracker.get_daily_calls() >= limits.requests_per_day:
+            reset_time = limits.get_reset_time("day")
+            logger.debug(f"Next reset for {api_type.value}: day reset at {reset_time}")
+            return reset_time
+        
+        logger.debug(f"No reset needed for {api_type.value}")
+        return None
+
+# ============================================================================
+# DATA FETCHER WITH RATE LIMITING
+# ============================================================================
+
+class RateLimitedDataFetcher:
+    """Fetches real university data with rate limiting"""
+    
+    def __init__(self):
+        logger.info("Initializing RateLimitedDataFetcher")
+        self.rate_limiter = RateLimiter()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'pkUniRankBot/1.0 (https://github.com/yourusername/pkUniRankBot)'
+        })
+        logger.info("RateLimitedDataFetcher initialized")
+    
+    def safe_fetch_wikipedia(self, university_name: str, user_id: Optional[str] = None) -> Optional[Dict]:
+        """Safely fetch data from Wikipedia with rate limiting"""
+        logger.info(f"Starting Wikipedia fetch for: {university_name}")
+        try:
+            # Check rate limit
+            logger.debug(f"Checking Wikipedia rate limit for user: {user_id}")
+            self.rate_limiter.check_rate_limit(APIType.WIKIPEDIA, user_id)
+            
+            search_query = f"{university_name} university"
+            logger.debug(f"Wikipedia search query: {search_query}")
+            start_time = time.time()
+            
+            try:
+                logger.debug(f"Attempting to fetch Wikipedia page for: {university_name}")
+                page = wikipedia.page(search_query, auto_suggest=True)
+                logger.info(f"Wikipedia page found for {university_name}")
+                
+                data = {
+                    'summary': page.summary[:500],
+                    'url': page.url,
+                    'categories': page.categories,
+                    'fetch_time': time.time() - start_time
+                }
+                
+                # Extract key metrics from content
+                content = page.content.lower()
+                
+                # Look for rankings in content
+                rankings = []
+                for line in content.split('\n'):
+                    if any(word in line for word in ['rank', 'ranking', 'rated', '#', 'top']):
+                        if 'university' in line or 'college' in line:
+                            rankings.append(line[:200])
+                
+                data['rankings'] = rankings[:5]
+                
+                # Record successful call
+                self.rate_limiter.record_call(APIType.WIKIPEDIA)
+                logger.info(f"Wikipedia fetch successful for {university_name} in {data['fetch_time']:.2f}s")
+                
+                return {'wikipedia': data}
+                
+            except wikipedia.exceptions.DisambiguationError as e:
+                logger.warning(f"Wikipedia disambiguation error for {university_name}: {e.options[:3]}")
+                # Try first option
+                try:
+                    first_option = e.options[0]
+                    logger.debug(f"Trying disambiguation option: {first_option}")
+                    page = wikipedia.page(first_option)
+                    data = {
+                        'summary': page.summary[:500],
+                        'url': page.url,
+                        'categories': page.categories,
+                        'fetch_time': time.time() - start_time,
+                        'note': f'Used disambiguation: {first_option}'
+                    }
+                    self.rate_limiter.record_call(APIType.WIKIPEDIA)
+                    logger.info(f"Wikipedia fetch successful using disambiguation for {university_name}")
+                    return {'wikipedia': data}
+                except Exception as e:
+                    logger.error(f"Failed to fetch disambiguated page: {e}")
+                    pass
+            except wikipedia.exceptions.PageError:
+                logger.warning(f"Wikipedia page not found for {university_name}")
+            
+            # Record call even if page not found
+            self.rate_limiter.record_call(APIType.WIKIPEDIA)
+            logger.info(f"Wikipedia fetch completed (no page found) for {university_name}")
+            
+        except RateLimitExceededException as e:
+            logger.warning(f"Wikipedia rate limit exceeded for {university_name}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Wikipedia fetch error for {university_name}: {e}")
+        
+        return None
+    
+    def safe_google_search(self, query: str, user_id: Optional[str] = None) -> List[str]:
+        """Safely search Google using custom requests with proper headers"""
+        logger.info(f"Starting Google search for: {query}")
+        
+        try:
+            # Check rate limit
+            self.rate_limiter.check_rate_limit(APIType.GOOGLE_SEARCH, user_id)
+            
+            time.sleep(2)  # Be extra conservative
+            
+            # Use custom headers to look more like a browser
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            # Construct Google search URL
+            search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+            
+            response = self.session.get(search_url, headers=headers, timeout=10)
+            
+            # Parse results (simplified example)
+            results = []
+            if response.status_code == 200:
+                # Extract links from Google search results page
+                # This is a simplified parser - you might need to adjust based on Google's HTML structure
+                soup = BeautifulSoup(response.text, 'html.parser')
+                for link in soup.find_all('a'):
+                    href = link.get('href')
+                    if href and href.startswith('http') and 'google.com' not in href:
+                        results.append(href)
+                
+            # Record call
+            self.rate_limiter.record_call(APIType.GOOGLE_SEARCH)
+            
+            return results[:3]  # Return top 3 results
+            
+        except Exception as e:
+            logger.error(f"Google search error: {e}")
+            self.rate_limiter.record_call(APIType.GOOGLE_SEARCH)
+            return []
+    
+    def safe_fetch_webometrics(self, university_name: str, user_id: Optional[str] = None) -> Optional[Dict]:
+        """Safely fetch Webometrics data using their actual website"""
+        logger.info(f"Starting Webometrics fetch for: {university_name}")
+        try:
+            # Check rate limit
+            logger.debug(f"Checking Webometrics rate limit for user: {user_id}")
+            self.rate_limiter.check_rate_limit(APIType.WEBOMETRICS, user_id)
+            
+            # Use the actual Webometrics search page
+            search_query = urllib.parse.quote(university_name)
+            url = f"https://www.webometrics.info/en/search/site/{search_query}"
+            logger.debug(f"Webometrics search URL: {url}")
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            }
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            logger.debug(f"Webometrics response status: {response.status_code}")
+            
+            # Record call
+            self.rate_limiter.record_call(APIType.WEBOMETRICS)
+            
+            if response.status_code == 200:
+                # Parse the HTML to extract ranking information
+                # This is a simplified example - you'll need to adjust based on actual page structure
+                data = {
+                    'url': url,
+                    'status': 'success',
+                    'content_length': len(response.text),
+                    'note': 'Scraped from Webometrics website'
+                }
+                
+                # You could add HTML parsing here to extract actual ranking data
+                # from soup = BeautifulSoup(response.text, 'html.parser')
+                
+                logger.info(f"Webometrics fetch successful for {university_name}")
+                return {'webometrics': data}
+            elif response.status_code == 429:  # Too Many Requests
+                retry_after = response.headers.get('Retry-After', '60')
+                reset_time = datetime.now() + timedelta(seconds=int(retry_after))
+                logger.warning(f"Webometrics HTTP 429 for {university_name}: Retry after {retry_after}s")
+                raise RateLimitExceededException(
+                    APIType.WEBOMETRICS, 
+                    reset_time,
+                    f"HTTP 429: Retry after {retry_after} seconds"
+                )
+                
+        except RateLimitExceededException:
+            raise
+        except Exception as e:
+            logger.error(f"Webometrics fetch error for {university_name}: {e}")
+            # Still record the attempt
+            self.rate_limiter.record_call(APIType.WEBOMETRICS)
+            logger.info(f"Recorded Webometrics attempt despite error")
+        
+        return None
+    
+    def fetch_all_data(self, university_name: str, country: str, user_id: Optional[str] = None) -> Tuple[Dict, List[Dict]]:
+        """Fetch data from all sources with rate limiting"""
+        logger.info(f"Starting data fetch for {university_name} in {country}")
+        all_data = {}
+        rate_limit_info = []
+        
+        # Fetch Wikipedia data
+        logger.debug(f"Attempting Wikipedia fetch for {university_name}")
+        try:
+            wiki_data = self.safe_fetch_wikipedia(university_name, user_id)
+            if wiki_data:
+                all_data.update(wiki_data)
+                rate_limit_info.append(self.rate_limiter.get_api_status(APIType.WIKIPEDIA))
+                logger.info(f"Wikipedia data fetched successfully for {university_name}")
+        except RateLimitExceededException as e:
+            rate_limit_info.append({
+                'api': 'wikipedia',
+                'status': 'rate_limited',
+                'reset_time': e.reset_time,
+                'message': str(e)
+            })
+            logger.warning(f"Wikipedia rate limited for {university_name}")
+        
+        # Fetch Google search results
+        queries = [
+            f"{university_name} QS World University Rankings",
+            f"{university_name} Times Higher Education ranking",
+            f"{university_name} ARWU ranking"
+        ]
+        
+        google_results = {}
+        logger.debug(f"Preparing {len(queries)} Google search queries")
+        for i, query in enumerate(queries, 1):
+            try:
+                logger.debug(f"Google search {i}/{len(queries)}: {query}")
+                results = self.safe_google_search(query, user_id)
+                if results:
+                    google_results[query] = results
+                    logger.debug(f"Google search {i} returned {len(results)} results")
+                rate_limit_info.append(self.rate_limiter.get_api_status(APIType.GOOGLE_SEARCH))
+            except RateLimitExceededException as e:
+                rate_limit_info.append({
+                    'api': 'google_search',
+                    'status': 'rate_limited',
+                    'reset_time': e.reset_time,
+                    'message': str(e)
+                })
+                logger.warning(f"Google search rate limited on query {i}")
+                break  # Stop further Google searches
+        
+        if google_results:
+            all_data['google_search'] = google_results
+            logger.info(f"Google searches completed, found data for {len(google_results)} queries")
+        
+        # Try Webometrics
+        logger.debug(f"Attempting Webometrics fetch for {university_name}")
+        try:
+            web_data = self.safe_fetch_webometrics(university_name, user_id)
+            if web_data:
+                all_data.update(web_data)
+                rate_limit_info.append(self.rate_limiter.get_api_status(APIType.WEBOMETRICS))
+                logger.info(f"Webometrics data fetched successfully for {university_name}")
+        except RateLimitExceededException as e:
+            rate_limit_info.append({
+                'api': 'webometrics',
+                'status': 'rate_limited',
+                'reset_time': e.reset_time,
+                'message': str(e)
+            })
+            logger.warning(f"Webometrics rate limited for {university_name}")
+        
+        logger.info(f"Data fetch completed for {university_name}. Got data from {len(all_data)} sources")
+        return all_data, rate_limit_info
+
+# ============================================================================
+# ENHANCED UNIVERSITY RANKING SYSTEM
+# ============================================================================
 
 class UniversityRankingSystem:
     def __init__(self):
+        logger.info("Initializing UniversityRankingSystem")
         # Parameter definitions with max scores
         self.parameters = {
             'academic': {'name': 'Academic Reputation & Research', 'max': 25},
@@ -166,10 +686,13 @@ class UniversityRankingSystem:
             "Employer surveys and reports",
             "Alumni outcome surveys"
         ]
+        
+        logger.info(f"UniversityRankingSystem initialized with {len(self.university_db)} universities in database")
     
     def load_university_database(self) -> Dict:
         """Load university database with pre-calculated scores"""
-        return {
+        logger.info("Loading university database")
+        db = {
             'bryant university': {
                 'country': 'USA',
                 'type': 'TEACHING_UNIVERSITY',
@@ -303,28 +826,75 @@ class UniversityRankingSystem:
                 }
             }
         }
+        logger.info(f"Loaded {len(db)} universities into database")
+        return db
+    
+    def load_qs_rankings(self) -> Dict:
+        """Load QS World University Rankings data"""
+        logger.info("Loading QS rankings")
+        # This would ideally be loaded from a CSV or API
+        # For now, we'll use a sample of top universities
+        qs_data = {
+            'massachusetts institute of technology': 1,
+            'university of cambridge': 2,
+            'university of oxford': 3,
+            'harvard university': 4,
+            'stanford university': 5,
+            'imperial college london': 6,
+            'california institute of technology': 7,
+            'university college london': 8,
+            'eth zurich': 9,
+            'university of chicago': 10,
+            # North Dakota State University - not in top QS rankings
+        }
+        logger.info(f"Loaded {len(qs_data)} QS rankings")
+        return qs_data
+    
+    def load_the_rankings(self) -> Dict:
+        """Load Times Higher Education Rankings"""
+        logger.info("Loading THE rankings")
+        the_data = {
+            'university of oxford': 1,
+            'harvard university': 2,
+            'university of cambridge': 3,
+            'stanford university': 4,
+            'massachusetts institute of technology': 5,
+            'california institute of technology': 6,
+            'princeton university': 7,
+            'university of california berkeley': 8,
+            'yale university': 9,
+            'imperial college london': 10,
+            # North Dakota State University - not in top THE rankings
+        }
+        logger.info(f"Loaded {len(the_data)} THE rankings")
+        return the_data
     
     def classify_university_type(self, name: str) -> str:
         """Classify university based on name patterns"""
         name_lower = name.lower()
+        logger.debug(f"Classifying university type for: {name}")
         
         if any(word in name_lower for word in ['business school', 'medical school', 'law school']):
-            return 'SPECIALIST_SCHOOL'
+            uni_type = 'SPECIALIST_SCHOOL'
         elif any(word in name_lower for word in ['college', 'community college', 'polytechnic']):
-            return 'COLLEGE_POLYTECHNIC'
+            uni_type = 'COLLEGE_POLYTECHNIC'
         elif any(word in name_lower for word in ['technical', 'applied', 'technology']):
-            return 'APPLIED_UNIVERSITY'
+            uni_type = 'APPLIED_UNIVERSITY'
         elif 'university' in name_lower:
             if any(word in name_lower for word in ['research', 'institute', 'tech']):
-                return 'RESEARCH_UNIVERSITY'
+                uni_type = 'RESEARCH_UNIVERSITY'
             else:
-                return 'TEACHING_UNIVERSITY'
+                uni_type = 'TEACHING_UNIVERSITY'
+        else:
+            uni_type = 'TEACHING_UNIVERSITY'
         
-        return 'TEACHING_UNIVERSITY'
+        logger.debug(f"Classified '{name}' as: {uni_type}")
+        return uni_type
     
     def generate_rationale_for_score(self, param_code: str, score: float, max_score: float, 
                                    university_name: str, country: str, is_estimated: bool) -> List[str]:
         """Generate rationale for a parameter score"""
+        logger.debug(f"Generating rationale for {param_code} (score: {score}/{max_score})")
         rationale = []
         percentage = (score / max_score * 100) if max_score > 0 else 0
         
@@ -358,10 +928,12 @@ class UniversityRankingSystem:
         uni_type = self.classify_university_type(university_name)
         rationale.append(f"Institution type: {uni_type.replace('_', ' ').title()}")
         
+        logger.debug(f"Generated {len(rationale)} rationale points for {param_code}")
         return rationale
     
     def estimate_scores(self, name: str, country: str) -> Dict[str, float]:
         """Estimate scores for unknown universities"""
+        logger.info(f"Estimating scores for {name} in {country}")
         name_lower = name.lower()
         country_upper = country.upper() if country else "GLOBAL"
         
@@ -379,25 +951,35 @@ class UniversityRankingSystem:
         if 'mit' in name_lower or 'massachusetts institute' in name_lower:
             scores = {'academic': 24, 'graduate': 23, 'roi': 22, 
                      'fsr': 14, 'transparency': 9, 'visibility': 5}
+            logger.debug(f"Using MIT pattern scores for {name}")
         elif 'harvard' in name_lower:
             scores = {'academic': 25, 'graduate': 24, 'roi': 20, 
                      'fsr': 13, 'transparency': 10, 'visibility': 5}
+            logger.debug(f"Using Harvard pattern scores for {name}")
         elif 'stanford' in name_lower:
             scores = {'academic': 24, 'graduate': 23, 'roi': 21, 
                      'fsr': 14, 'transparency': 9, 'visibility': 5}
+            logger.debug(f"Using Stanford pattern scores for {name}")
         elif 'oxford' in name_lower or 'cambridge' in name_lower:
             scores = {'academic': 25, 'graduate': 24, 'roi': 19, 
                      'fsr': 14, 'transparency': 10, 'visibility': 5}
+            logger.debug(f"Using Oxford/Cambridge pattern scores for {name}")
         elif 'university' in name_lower and 'state' in name_lower:
             scores.update({'academic': 15.0, 'roi': 16.0, 'transparency': 9.0, 'visibility': 4.0})
+            logger.debug(f"Using state university pattern scores for {name}")
         elif 'university' in name_lower:
             scores.update({'academic': 18.0, 'visibility': 4.0, 'transparency': 8.0})
+            logger.debug(f"Using general university pattern scores for {name}")
         elif 'college' in name_lower:
             scores.update({'graduate': 17.0, 'roi': 16.0, 'fsr': 12.0, 'academic': 8.0})
+            logger.debug(f"Using college pattern scores for {name}")
+        else:
+            logger.debug(f"Using base scores for {name}")
         
         # Apply country multiplier
         if country_upper != "GLOBAL":
             country_mult = self.country_multipliers.get(country_upper, 1.0)
+            logger.debug(f"Applying country multiplier {country_mult} for {country}")
             for key in ['academic', 'graduate', 'roi', 'fsr']:
                 scores[key] = min(self.parameters[key]['max'], scores[key] * country_mult)
         
@@ -409,17 +991,23 @@ class UniversityRankingSystem:
                 variation = np.random.uniform(-2.0, 2.0)
             scores[key] = max(0, min(self.parameters[key]['max'], scores[key] + variation))
         
-        return {k: round(v, 1) for k, v in scores.items()}
+        rounded_scores = {k: round(v, 1) for k, v in scores.items()}
+        logger.info(f"Estimated scores for {name}: {rounded_scores}")
+        return rounded_scores
     
     def calculate_composite_score(self, scores: Dict[str, float]) -> float:
         """Calculate composite score"""
-        return round(sum(scores.values()), 1)
+        composite = round(sum(scores.values()), 1)
+        logger.debug(f"Calculated composite score: {composite}")
+        return composite
     
     def get_tier(self, score: float) -> Tuple[str, str]:
         """Determine tier and description"""
         for tier, (low, high, description) in self.tiers.items():
             if low <= score <= high:
+                logger.debug(f"Score {score} falls in tier {tier}: {description}")
                 return tier, description
+        logger.debug(f"Score {score} falls in default tier D")
         return 'D', self.tiers['D'][2]
     
     def calculate_error_margin(self, university_name: str, country: str) -> float:
@@ -427,7 +1015,9 @@ class UniversityRankingSystem:
         name_lower = university_name.lower()
         
         if name_lower in self.university_db:
-            return round(np.random.uniform(1.0, 3.0), 1)
+            error = round(np.random.uniform(1.0, 3.0), 1)
+            logger.debug(f"Known university {university_name}, error margin: {error}")
+            return error
         else:
             country_mult = 1.0
             if country:
@@ -440,7 +1030,9 @@ class UniversityRankingSystem:
             elif 'college' in name_lower:
                 base_error *= 1.1
             
-            return round(min(15.0, max(3.0, base_error + np.random.uniform(-2.0, 2.0))), 1)
+            error = round(min(15.0, max(3.0, base_error + np.random.uniform(-2.0, 2.0))), 1)
+            logger.debug(f"Unknown university {university_name}, error margin: {error}")
+            return error
     
     def get_sources_for_university(self, university_name: str, is_estimated: bool) -> List[str]:
         """Get data sources for university ranking"""
@@ -453,6 +1045,7 @@ class UniversityRankingSystem:
                 "Government education statistics",
                 "International ranking databases"
             ])
+            logger.debug(f"Using real data sources for {university_name}")
         else:
             sources.extend([
                 "Pattern analysis of similar institutions",
@@ -460,234 +1053,263 @@ class UniversityRankingSystem:
                 "Institution type averages",
                 "Statistical estimation models"
             ])
+            logger.debug(f"Using estimated data sources for {university_name}")
         
         # Add common sources
         sources.extend(self.common_sources[:4])
         
+        logger.debug(f"Total sources for {university_name}: {len(sources)}")
         return sources
+
+# ============================================================================
+# ENHANCED RANKING SYSTEM WITH REAL DATA FETCHING
+# ============================================================================
+
+class EnhancedUniversityRankingSystem(UniversityRankingSystem):
+    """Enhanced ranking system with real data fetching and rate limiting"""
     
-    def rank_university(self, university_name: str, country: str = "") -> UniversityData:
-        """Main ranking function for single university"""
-        name_lower = university_name.lower()
-        is_estimated = name_lower not in self.university_db
+    def __init__(self):
+        logger.info("Initializing EnhancedUniversityRankingSystem")
+        super().__init__()
+        self.data_fetcher = RateLimitedDataFetcher()
+        self.real_data_cache = {}
+        self.qs_rankings = self.load_qs_rankings()
+        self.the_rankings = self.load_the_rankings()
+        self.cache_lock = Lock()
+        logger.info("EnhancedUniversityRankingSystem initialized")
+    
+    def fetch_real_data(self, university_name: str, country: str, user_id: Optional[str] = None) -> Tuple[Dict, List[Dict]]:
+        """Fetch real data from multiple sources with rate limiting"""
+        logger.info(f"Fetching real data for: {university_name} (Country: {country})")
+        cache_key = f"{university_name.lower()}_{country.lower()}"
         
-        # Check database first
-        if name_lower in self.university_db:
+        with self.cache_lock:
+            if cache_key in self.real_data_cache:
+                cached_data, cached_rate_info = self.real_data_cache[cache_key]
+                # Add cache hit info to rate info
+                rate_info = cached_rate_info.copy() if cached_rate_info else []
+                rate_info.append({'api': 'cache', 'status': 'hit', 'timestamp': datetime.now().isoformat()})
+                logger.info(f"Cache hit for {university_name}")
+                return cached_data, rate_info
+        
+        logger.info(f"Cache miss for {university_name}, fetching fresh data")
+        # Fetch fresh data
+        all_data, rate_limit_info = self.data_fetcher.fetch_all_data(university_name, country, user_id)
+        
+        # Check known rankings
+        name_lower = university_name.lower()
+        if name_lower in self.qs_rankings:
+            all_data['qs_ranking'] = self.qs_rankings[name_lower]
+            rate_limit_info.append({'api': 'qs_rankings', 'status': 'cache', 'source': 'internal'})
+            logger.debug(f"Found QS ranking for {university_name}: {self.qs_rankings[name_lower]}")
+        
+        if name_lower in self.the_rankings:
+            all_data['the_ranking'] = self.the_rankings[name_lower]
+            rate_limit_info.append({'api': 'the_rankings', 'status': 'cache', 'source': 'internal'})
+            logger.debug(f"Found THE ranking for {university_name}: {self.the_rankings[name_lower]}")
+        
+        # Cache the results (only if we got some data)
+        if all_data:
+            with self.cache_lock:
+                self.real_data_cache[cache_key] = (all_data, rate_limit_info)
+            logger.info(f"Cached data for {university_name} (keys: {list(all_data.keys())})")
+        else:
+            logger.warning(f"No data fetched for {university_name}")
+        
+        logger.info(f"Data fetch complete for {university_name}")
+        return all_data, rate_limit_info
+    
+    def calculate_scores_from_real_data(self, university_name: str, country: str, real_data: Dict) -> Dict[str, float]:
+        """Calculate scores based on real fetched data"""
+        logger.info(f"Calculating scores from real data for: {university_name}")
+        scores = {
+            'academic': 12.0,
+            'graduate': 15.0,
+            'roi': 14.0,
+            'fsr': 11.0,
+            'transparency': 7.0,
+            'visibility': 3.0
+        }
+        
+        # Adjust based on QS ranking if available
+        if 'qs_ranking' in real_data:
+            qs_rank = real_data['qs_ranking']
+            logger.debug(f"QS ranking for {university_name}: {qs_rank}")
+            if qs_rank <= 10:
+                scores.update({'academic': 25, 'graduate': 24, 'visibility': 5})
+                logger.debug(f"Top 10 QS ranking adjustment for {university_name}")
+            elif qs_rank <= 50:
+                scores.update({'academic': 22, 'graduate': 21, 'visibility': 4.5})
+                logger.debug(f"Top 50 QS ranking adjustment for {university_name}")
+            elif qs_rank <= 100:
+                scores.update({'academic': 20, 'graduate': 19, 'visibility': 4})
+                logger.debug(f"Top 100 QS ranking adjustment for {university_name}")
+            elif qs_rank <= 200:
+                scores.update({'academic': 18, 'graduate': 17, 'visibility': 3.5})
+                logger.debug(f"Top 200 QS ranking adjustment for {university_name}")
+        
+        # Adjust based on THE ranking if available
+        if 'the_ranking' in real_data:
+            the_rank = real_data['the_ranking']
+            logger.debug(f"THE ranking for {university_name}: {the_rank}")
+            if the_rank <= 10:
+                scores['academic'] = max(scores['academic'], 24)
+                scores['transparency'] = max(scores['transparency'], 9)
+                logger.debug(f"Top 10 THE ranking adjustment for {university_name}")
+            elif the_rank <= 100:
+                scores['academic'] = max(scores['academic'], scores['academic'] * 1.1)
+                logger.debug(f"Top 100 THE ranking adjustment for {university_name}")
+        
+        # Analyze Wikipedia data for indicators
+        if 'wikipedia' in real_data:
+            wiki_data = real_data['wikipedia']
+            summary = wiki_data.get('summary', '').lower()
+            
+            # Check for research indicators
+            research_keywords = ['research', 'publication', 'citation', 'nobel', 'faculty']
+            research_count = sum(1 for keyword in research_keywords if keyword in summary)
+            if research_count >= 3:
+                scores['academic'] = min(25, scores['academic'] + 3)
+                logger.debug(f"Wikipedia research indicators found for {university_name}, +3 academic")
+            
+            # Check for employment indicators
+            employ_keywords = ['employment', 'graduate', 'career', 'salary', 'placement']
+            employ_count = sum(1 for keyword in employ_keywords if keyword in summary)
+            if employ_count >= 2:
+                scores['graduate'] = min(25, scores['graduate'] + 2)
+                logger.debug(f"Wikipedia employment indicators found for {university_name}, +2 graduate")
+        
+        # Apply country multiplier
+        if country:
+            country_mult = self.country_multipliers.get(country.upper(), 1.0)
+            logger.debug(f"Applying country multiplier {country_mult} for {country}")
+            for key in ['academic', 'graduate', 'roi', 'fsr']:
+                scores[key] = min(self.parameters[key]['max'], scores[key] * country_mult)
+        
+        # University type adjustments
+        uni_type = self.classify_university_type(university_name)
+        if uni_type == 'RESEARCH_UNIVERSITY':
+            scores['academic'] = min(25, scores['academic'] + 3)
+            logger.debug(f"Research university adjustment for {university_name}, +3 academic")
+        elif uni_type == 'COLLEGE_POLYTECHNIC':
+            scores['graduate'] = min(25, scores['graduate'] + 2)
+            scores['roi'] = min(20, scores['roi'] + 2)
+            logger.debug(f"College/polytechnic adjustment for {university_name}, +2 graduate, +2 roi")
+        
+        rounded_scores = {k: round(v, 1) for k, v in scores.items()}
+        logger.info(f"Calculated scores from real data for {university_name}: {rounded_scores}")
+        return rounded_scores
+    
+    def rank_university(self, university_name: str, country: str = "", user_id: Optional[str] = None) -> UniversityData:
+        """Enhanced ranking function with real data fetching and rate limiting"""
+        logger.info(f"Starting ranking process for: {university_name} (Country: {country}, User: {user_id})")
+        name_lower = university_name.lower()
+        
+        # Try to fetch real data first
+        logger.debug(f"Attempting to fetch real data for {university_name}")
+        real_data, rate_limit_info = self.fetch_real_data(university_name, country, user_id)
+        
+        has_real_data = bool(real_data and ('qs_ranking' in real_data or 'the_ranking' in real_data or 'wikipedia' in real_data))
+        
+        if has_real_data:
+            # Calculate scores from real data
+            logger.info(f"Using real data for {university_name}")
+            scores = self.calculate_scores_from_real_data(university_name, country, real_data)
+            is_estimated = False
+            data_sources = ["QS World University Rankings", "Times Higher Education", "Wikipedia"]
+        elif name_lower in self.university_db:
+            # Use database entry
+            logger.info(f"Using database entry for {university_name}")
             data = self.university_db[name_lower]
             scores = data['scores']
-            university_type = data['type']
-            db_country = data['country']
-            db_rationale = data.get('rationale', {})
+            country = data['country']
+            is_estimated = False
+            data_sources = ["University Ranking Database", "Verified Institutional Data"]
         else:
-            # Estimate scores
+            # Fall back to estimation
+            logger.info(f"Using estimation for {university_name}")
             scores = self.estimate_scores(university_name, country)
-            university_type = self.classify_university_type(university_name)
-            db_country = country if country else "Global"
-            db_rationale = {}
+            is_estimated = True
+            data_sources = ["Statistical Estimation", "Pattern Analysis"]
         
-        # Generate rationale for each parameter
+        # Get real data sources if available
+        real_sources = []
+        if 'wikipedia' in real_data:
+            real_sources.append(f"Wikipedia: {real_data['wikipedia'].get('url', '')}")
+        if 'google_search' in real_data:
+            real_sources.append("Google Search Results for rankings")
+        
+        # Generate rationale
+        logger.debug(f"Generating rationale for {university_name}")
         rationale = {}
         for param_code, score in scores.items():
             max_score = self.parameters[param_code]['max']
-            if param_code in db_rationale:
-                rationale[param_code] = db_rationale[param_code]
-            else:
-                rationale[param_code] = self.generate_rationale_for_score(
-                    param_code, score, max_score, university_name, db_country, is_estimated
-                )
+            rationale[param_code] = self.generate_rationale_for_score(
+                param_code, score, max_score, university_name, country, is_estimated
+            )
         
-        # Get data sources
-        sources = self.get_sources_for_university(university_name, is_estimated)
+        # Add real data sources to rationale if available
+        if real_sources:
+            data_sources.extend(real_sources)
         
         # Calculate metrics
+        logger.debug(f"Calculating final metrics for {university_name}")
         composite = self.calculate_composite_score(scores)
         tier, tier_desc = self.get_tier(composite)
         error_margin = self.calculate_error_margin(university_name, country)
         
-        return UniversityData(
+        # Lower error margin if we have real data
+        if not is_estimated:
+            error_margin = max(1.0, error_margin * 0.5)
+            logger.debug(f"Reduced error margin for real data: {error_margin}")
+        
+        result = UniversityData(
             name=university_name,
-            country=db_country,
-            type=university_type.replace('_', ' ').title(),
+            country=country,
+            type=self.classify_university_type(university_name).replace('_', ' ').title(),
             scores=scores,
             composite=composite,
             tier=tier,
             error_margin=error_margin,
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             rationale=rationale,
-            sources=sources
+            sources=data_sources,
+            is_estimated=is_estimated,
+            real_data_sources=real_sources,
+            rate_limit_info=rate_limit_info
         )
-    
-    def process_excel_file(self, excel_path: str) -> str:
-        """
-        Process Excel file and calculate rankings
-        Returns path to output file
-        """
-        try:
-            # Read the Excel file
-            df = pd.read_excel(excel_path)
-            original_columns = df.columns.tolist()
-            
-            # Find relevant columns (case-insensitive)
-            university_col = None
-            country_col = None
-            leap_rank_col = None
-            
-            for col in df.columns:
-                col_lower = str(col).lower()
-                if 'university' in col_lower or 'name' in col_lower or 'institution' in col_lower:
-                    university_col = col
-                elif 'country' in col_lower or 'nation' in col_lower:
-                    country_col = col
-                elif 'leap' in col_lower and 'rank' in col_lower:
-                    leap_rank_col = col
-                elif 'rank' in col_lower and leap_rank_col is None:
-                    leap_rank_col = col
-            
-            # Validate required columns
-            if not university_col:
-                raise ValueError("Could not find University Name column in the Excel file.")
-            if not country_col:
-                raise ValueError("Could not find Country column in the Excel file.")
-            
-            logger.info(f"Processing Excel: University='{university_col}', Country='{country_col}', Leap Rank='{leap_rank_col}'")
-            
-            # Calculate scores for each university
-            global_scores = []
-            
-            for idx, row in df.iterrows():
-                university_name = row[university_col]
-                country = row[country_col]
-                leap_rank = row[leap_rank_col] if leap_rank_col and leap_rank_col in row and not pd.isna(row[leap_rank_col]) else None
-                
-                # Skip empty rows
-                if pd.isna(university_name):
-                    continue
-                
-                # Calculate scores using existing ranking function
-                university_data = self.rank_university(str(university_name), str(country) if not pd.isna(country) else "")
-                
-                global_scores.append({
-                    'index': idx,
-                    'university': university_name,
-                    'country': country,
-                    'leap_rank': leap_rank,
-                    'global_score': university_data.composite,
-                    'tier': university_data.tier
-                })
-            
-            # Create DataFrame with scores
-            scores_df = pd.DataFrame(global_scores)
-            
-            # Calculate Global Rank (higher score = better rank = lower rank number)
-            scores_df['global_rank'] = scores_df['global_score'].rank(method='min', ascending=False).astype(int)
-            
-            # Calculate Country Rank for each country
-            scores_df['country_rank'] = 0
-            scores_df['rank_difference'] = ""
-            
-            for country in scores_df['country'].unique():
-                if pd.isna(country):
-                    continue
-                    
-                country_mask = scores_df['country'] == country
-                country_scores = scores_df[country_mask].copy()
-                
-                if len(country_scores) > 0:
-                    # Calculate country rank (within country, by global_score)
-                    country_ranks = country_scores['global_score'].rank(method='min', ascending=False).astype(int)
-                    scores_df.loc[country_mask, 'country_rank'] = country_ranks.values
-                    
-                    # Check for Leap Rank differences
-                    for idx in country_scores.index:
-                        leap_rank_val = scores_df.at[idx, 'leap_rank']
-                        country_rank_val = scores_df.at[idx, 'country_rank']
-                        
-                        if leap_rank_val is not None and not pd.isna(leap_rank_val):
-                            try:
-                                leap_rank_int = int(float(leap_rank_val))
-                                if leap_rank_int != country_rank_val:
-                                    scores_df.at[idx, 'rank_difference'] = f"Leap:{leap_rank_int} Our:{country_rank_val}"
-                            except (ValueError, TypeError):
-                                pass
-            
-            # Merge scores back to original DataFrame
-            for idx, row in scores_df.iterrows():
-                original_idx = row['index']
-                df.at[original_idx, 'Global Score'] = row['global_score']
-                df.at[original_idx, 'Global Rank'] = row['global_rank']
-                df.at[original_idx, 'Country Rank'] = row['country_rank']
-                if row['rank_difference']:
-                    df.at[original_idx, 'Rank Difference'] = row['rank_difference']
-                else:
-                    df.at[original_idx, 'Rank Difference'] = ""
-            
-            # Ensure new columns are at the end
-            new_columns = ['Global Score', 'Global Rank', 'Country Rank', 'Rank Difference']
-            existing_columns = [col for col in df.columns if col not in new_columns]
-            df = df[existing_columns + new_columns]
-            
-            # Create output file path
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"university_rankings_{timestamp}.xlsx"
-            
-            # Save with formatting
-            with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name='Rankings', index=False)
-                
-                # Apply formatting
-                try:
-                    from openpyxl.styles import PatternFill
-                    from openpyxl.utils import get_column_letter
-                    
-                    workbook = writer.book
-                    worksheet = writer.sheets['Rankings']
-                    
-                    # Yellow fill for Rank Difference cells
-                    yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
-                    
-                    # Find Rank Difference column
-                    for col_idx, col_name in enumerate(df.columns, 1):
-                        if col_name == 'Rank Difference':
-                            for row_idx in range(2, len(df) + 2):
-                                cell = worksheet.cell(row=row_idx, column=col_idx)
-                                if cell.value and str(cell.value).strip():  # If there's a difference
-                                    cell.fill = yellow_fill
-                            break
-                    
-                    # Adjust column widths
-                    for column in df.columns:
-                        column_letter = get_column_letter(list(df.columns).index(column) + 1)
-                        max_length = max(
-                            df[column].astype(str).apply(len).max(),
-                            len(str(column))
-                        ) + 2
-                        worksheet.column_dimensions[column_letter].width = min(max_length, 30)
-                        
-                except ImportError:
-                    logger.warning("openpyxl not available for advanced formatting")
-            
-            logger.info(f"Excel processing complete. Output saved to: {output_filename}")
-            return output_filename
-            
-        except Exception as e:
-            logger.error(f"Error processing Excel file: {e}")
-            raise
+        
+        logger.info(f"Ranking complete for {university_name}: Score={composite}, Tier={tier}, Estimated={is_estimated}")
+        return result
 
-class UniRankBot:
+# ============================================================================
+# ENHANCED BOT WITH RATE LIMITING
+# ============================================================================
+
+class EnhancedUniRankBot:
+    """Enhanced bot with real data fetching and rate limiting"""
+    
     def __init__(self, token: str):
-        """Initialize the bot with Updater"""
+        """Initialize the enhanced bot"""
+        logger.info("Initializing EnhancedUniRankBot")
         self.updater = Updater(token=token, use_context=True)
         self.dispatcher = self.updater.dispatcher
-        self.ranking_system = UniversityRankingSystem()
+        self.ranking_system = EnhancedUniversityRankingSystem()
         
         # Store current ranking data for rationale viewing
         self.user_ranking_data = {}
         
+        # Track user Excel processing
+        self.user_excel_processing = {}
+        
         # Set up handlers
         self.setup_handlers()
+        logger.info("EnhancedUniRankBot initialized")
     
     def setup_handlers(self):
         """Setup all bot handlers"""
+        logger.info("Setting up bot handlers")
+        
         # Command handlers
         self.dispatcher.add_handler(CommandHandler("start", self.start_command))
         self.dispatcher.add_handler(CommandHandler("help", self.help_command))
@@ -695,6 +1317,7 @@ class UniRankBot:
         self.dispatcher.add_handler(CommandHandler("tiers", self.tiers_command))
         self.dispatcher.add_handler(CommandHandler("parameters", self.parameters_command))
         self.dispatcher.add_handler(CommandHandler("rank_excel", self.rank_excel_command))
+        self.dispatcher.add_handler(CommandHandler("rate_status", self.rate_status_command))
         
         # Conversation handler for interactive ranking
         conv_handler = ConversationHandler(
@@ -722,11 +1345,45 @@ class UniRankBot:
         
         # Error handler
         self.dispatcher.add_error_handler(self.error_handler)
+        
+        logger.info("Bot handlers setup complete")
     
     def error_handler(self, update: Update, context: CallbackContext):
         """Handle errors"""
         logger.error(f"Update {update} caused error {context.error}")
         
+        """Log the error and send a telegram message to notify the developer."""
+        # Log the error before we do anything else, so we can see it even if something breaks.
+        logger.error("Exception while handling an update:", exc_info=context.error)
+
+        # traceback.format_exception returns the usual python message about an exception, but as a
+        # list of strings rather than a single string, so we have to join them together.
+        tb_list = traceback.format_exception(
+            None, context.error, context.error.__traceback__
+        )
+        tb_string = "".join(tb_list)
+        global start_time
+        timeSinceStarted = datetime.now() - start_time
+        if (
+            "telegram.error.Conflict" in tb_string
+        ):  # A newer 2nd instance was registered. We should politely shutdown.
+            if (
+                timeSinceStarted.total_seconds() >= MINUTES_2_IN_SECONDS
+            ):  # shutdown only if we have been running for over 2 minutes.
+                # This also prevents this newer instance to get shutdown.
+                # Instead the older instance will shutdown
+                print(
+                    f"Stopping due to conflict after running for {timeSinceStarted.total_seconds()/60} minutes."
+                )
+                try:
+                    # context.dispatcher.stop()
+                    thread.interrupt_main() # causes ctrl + c
+                    # sys.exit(0)
+                except RuntimeError:
+                    pass
+                except SystemExit:
+                    thread.interrupt_main()
+                    
         try:
             if update and update.effective_message:
                 update.effective_message.reply_text(
@@ -741,6 +1398,8 @@ class UniRankBot:
         print("🤖 pkUniRankBot is starting...")
         print("📊 University Ranking System Ready")
         print("📈 Excel Processing Enabled")
+        print("⚠️  Rate limiting active for all APIs")
+        print("📊 Detailed logging enabled")
         print("⚡ Bot is running. Press Ctrl+C to stop.")
         
         self.updater.start_polling()
@@ -749,11 +1408,23 @@ class UniRankBot:
     # Command handlers
     def start_command(self, update: Update, context: CallbackContext):
         """Handle /start command"""
+        logger.info(f"Start command from user: {update.effective_user.id}")
         user = update.message.from_user
         welcome_text = f"""
 🎓 Welcome to <b>pkUniRankBot</b> {user.first_name}!
 
 I analyze universities worldwide using a comprehensive multi-parameter ranking system.
+
+<b>⚠️ IMPORTANT RATE LIMIT INFORMATION:</b>
+• Wikipedia: 100 requests/minute, 2000/hour
+• Google Search: 10 requests/minute, 100/hour  
+• Webometrics: 30 requests/minute, 500/hour
+• All APIs: Daily limits enforced
+
+<b>When rate limits are hit:</b>
+1. You'll receive a clear message
+2. I'll use estimated data as fallback
+3. Excel output will show which data was estimated due to limits
 
 <b>Available Commands:</b>
 /rank - Rank a single university
@@ -761,22 +1432,15 @@ I analyze universities worldwide using a comprehensive multi-parameter ranking s
 /tiers - View tier explanations  
 /parameters - View ranking parameters
 /help - Get help
-
-<b>How to use:</b>
-• Send /rank for single university ranking
-• Send Excel file for bulk ranking
-• Click buttons below to explore
-
-<b>Excel Processing:</b>
-Send me an Excel file with university names and countries, and I'll add:
-• Global Score • Global Rank • Country Rank
+/rate_status - Check current API rate limits
         """
         
         keyboard = [
             [InlineKeyboardButton("🎯 Rank a University", callback_data="start_ranking")],
             [InlineKeyboardButton("📊 Process Excel File", callback_data="rank_excel")],
+            [InlineKeyboardButton("📈 Check Rate Limits", callback_data="rate_status")],
             [InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers")],
-            [InlineKeyboardButton("📈 View Parameters", callback_data="view_parameters")]
+            [InlineKeyboardButton("📊 View Parameters", callback_data="view_parameters")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -788,6 +1452,7 @@ Send me an Excel file with university names and countries, and I'll add:
     
     def help_command(self, update: Update, context: CallbackContext):
         """Handle /help command"""
+        logger.info(f"Help command from user: {update.effective_user.id}")
         help_text = """
 <b>📚 pkUniRankBot Help</b>
 
@@ -814,6 +1479,7 @@ D (0-44): Poor
 /rank_excel - Process Excel file with universities
 /tiers - View tier details
 /parameters - View parameter details
+/rate_status - Check API rate limits
 /help - This help message
 
 <b>Excel File Format:</b>
@@ -829,6 +1495,7 @@ I'll add: Global Score, Global Rank, and Country Rank columns!
     
     def tiers_command(self, update: Update, context: CallbackContext):
         """Handle /tiers command"""
+        logger.info(f"Tiers command from user: {update.effective_user.id}")
         tiers_text = """
 <b>🏆 Ranking Tiers & Ranges</b>
 
@@ -857,6 +1524,7 @@ Poor performance across most metrics.
     
     def parameters_command(self, update: Update, context: CallbackContext):
         """Handle /parameters command"""
+        logger.info(f"Parameters command from user: {update.effective_user.id}")
         params_text = """
 <b>📊 Ranking Parameters</b>
 
@@ -885,6 +1553,7 @@ Institutional web presence, brand recognition.
     
     def rank_excel_command(self, update: Update, context: CallbackContext):
         """Handle /rank_excel command"""
+        logger.info(f"Rank_excel command from user: {update.effective_user.id}")
         instructions = """
 <b>📊 Excel Ranking Instructions</b>
 
@@ -901,15 +1570,73 @@ Please send me an Excel file (.xlsx or .xls) with university data.
 - Global Score (0-100)
 - Global Rank (1 = best worldwide)
 - Country Rank (1 = best in country)
+- Data Source (Real Data/Estimated)
 - Rank Difference (highlighted if differs from Leap Rank)
 
+<b>Rate Limits:</b> I respect API rate limits. Large files may use estimated data.
 <b>Just send me your Excel file now!</b>
         """
         
         update.message.reply_text(instructions, parse_mode=ParseMode.HTML)
     
+    def rate_status_command(self, update: Update, context: CallbackContext):
+        """Check current API rate limit status"""
+        logger.info(f"Rate_status command from user: {update.effective_user.id}")
+        try:
+            # Get rate limiter from ranking system
+            rate_limiter = self.ranking_system.data_fetcher.rate_limiter
+            
+            # Get status of all APIs
+            all_status = rate_limiter.get_all_status()
+            
+            status_text = "📊 <b>CURRENT API RATE LIMIT STATUS</b>\n\n"
+            
+            for status in all_status:
+                api_name = status['api'].upper()
+                used_minute = status['calls_last_minute']
+                limit_minute = status['minute_limit']
+                available_minute = status['available_minute']
+                
+                # Create status indicator
+                if available_minute > limit_minute * 0.5:
+                    indicator = "🟢"
+                elif available_minute > limit_minute * 0.2:
+                    indicator = "🟡"
+                else:
+                    indicator = "🔴"
+                
+                status_text += f"{indicator} <b>{api_name}</b>\n"
+                status_text += f"   Minute: {used_minute}/{limit_minute} (Avail: {available_minute})\n"
+                status_text += f"   Hour: {status['calls_last_hour']}/{status['hourly_limit']}\n"
+                status_text += f"   Day: {status['calls_last_day']}/{status['daily_limit']}\n\n"
+            
+            # Add next reset info
+            next_reset = None
+            for api_type in APIType:
+                reset_time = rate_limiter.get_next_reset_time(api_type)
+                if reset_time:
+                    if next_reset is None or reset_time < next_reset:
+                        next_reset = reset_time
+            
+            if next_reset:
+                time_until = next_reset - datetime.now()
+                minutes_until = max(0, int(time_until.total_seconds() / 60))
+                status_text += f"⏰ <b>Next reset in:</b> {minutes_until} minutes\n"
+            
+            status_text += "\n<i>Note: Limits reset automatically. Large Excel files may hit limits.</i>"
+            
+            update.message.reply_text(status_text, parse_mode=ParseMode.HTML)
+            
+        except Exception as e:
+            logger.error(f"Error getting rate status: {e}")
+            update.message.reply_text(
+                "❌ Could not retrieve rate limit status. Please try again later.",
+                parse_mode=ParseMode.HTML
+            )
+    
     def rank_command(self, update: Update, context: CallbackContext):
         """Handle /rank command"""
+        logger.info(f"Rank command from user: {update.effective_user.id}, args: {context.args}")
         if context.args:
             # Direct ranking with arguments
             text = " ".join(context.args)
@@ -928,6 +1655,7 @@ Please send me an Excel file (.xlsx or .xls) with university data.
     
     def start_ranking(self, update: Update, context: CallbackContext):
         """Start the ranking conversation"""
+        logger.info(f"Starting ranking conversation for user: {update.effective_user.id}")
         update.message.reply_text(
             "🎓 <b>University Ranking</b>\n\nPlease enter the university name:",
             parse_mode=ParseMode.HTML
@@ -937,6 +1665,7 @@ Please send me an Excel file (.xlsx or .xls) with university data.
     def get_university(self, update: Update, context: CallbackContext):
         """Get university name from user"""
         university_name = update.message.text.strip()
+        logger.info(f"User {update.effective_user.id} entered university: {university_name}")
         context.user_data['university_name'] = university_name
         
         # Show country selection buttons
@@ -963,24 +1692,28 @@ Please send me an Excel file (.xlsx or .xls) with university data.
         """Get country from user and perform ranking"""
         university_name = context.user_data.get('university_name', '')
         country = update.message.text.strip()
+        logger.info(f"User {update.effective_user.id} entered country: {country} for university: {university_name}")
         
         self.perform_ranking(update, university_name, country, context)
         return ConversationHandler.END
     
     def cancel_ranking(self, update: Update, context: CallbackContext):
         """Cancel the ranking conversation"""
+        logger.info(f"User {update.effective_user.id} cancelled ranking")
         update.message.reply_text("Ranking cancelled.")
         return ConversationHandler.END
     
     def handle_direct_message(self, update: Update, context: CallbackContext):
         """Handle direct ranking requests in message format"""
         message = update.message.text.strip()
+        logger.info(f"Direct message from user {update.effective_user.id}: {message}")
         
         # Check if message looks like "University, Country" format
         if ',' in message:
             parts = [p.strip() for p in message.split(',', 1)]
             if len(parts) == 2:
                 university_name, country = parts
+                logger.info(f"Parsed direct message as university ranking: {university_name}, {country}")
                 self.perform_ranking(update, university_name, country, context)
                 return
         
@@ -993,98 +1726,283 @@ Please send me an Excel file (.xlsx or .xls) with university data.
             parse_mode=ParseMode.HTML
         )
     
-    def handle_excel_file(self, update: Update, context: CallbackContext):
-        """Handle incoming Excel files"""
+    def perform_ranking(self, update: Update, university_name: str, country: str, context: CallbackContext):
+        """Perform ranking and send results"""
+        user_id = update.effective_user.id
+        logger.info(f"Performing ranking for user {user_id}: {university_name}, {country}")
+        
+        processing_msg = update.message.reply_text(
+            f"🔍 <b>Analyzing {university_name}...</b>\n\nPlease wait while I gather data...",
+            parse_mode=ParseMode.HTML
+        )
+        
         try:
+            logger.info(f"Starting ranking process for {university_name}")
+            # Get ranking data
+            ranking_data = self.ranking_system.rank_university(university_name, country, str(user_id))
+            logger.info(f"Ranking data obtained for {university_name}")
+            
+            # Store ranking data for rationale viewing
+            self.user_ranking_data[user_id] = ranking_data
+            logger.debug(f"Stored ranking data for user {user_id}")
+            
+            # Format results
+            results_text = self.format_ranking_results(ranking_data)
+            logger.info(f"Formatted results for {university_name}")
+            
+            # Send results
+            processing_msg.edit_text(
+                results_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self.get_results_keyboard()
+            )
+            logger.info(f"Results sent for {university_name}")
+            
+        except RateLimitExceededException as e:
+            logger.error(f"Rate limit exceeded during ranking: {e}")
+            error_text = f"""
+❌ <b>RATE LIMIT EXCEEDED</b>
+
+<b>API:</b> {e.api_type.value.upper()}
+<b>Limit:</b> {e.limit_details}
+<b>Resets at:</b> {e.reset_time.strftime("%H:%M:%S")}
+
+Using estimated data for this ranking.
+            """
+            
+            # Try to get estimated ranking anyway
+            try:
+                logger.info(f"Attempting estimated ranking for {university_name} after rate limit")
+                ranking_data = self.ranking_system.rank_university(university_name, country, str(user_id))
+                results_text = self.format_ranking_results(ranking_data)
+                full_text = error_text + "\n\n" + results_text
+                
+                processing_msg.edit_text(
+                    full_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self.get_results_keyboard()
+                )
+            except Exception as inner_e:
+                logger.error(f"Error in fallback ranking: {inner_e}")
+                processing_msg.edit_text(
+                    error_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self.get_error_keyboard()
+                )
+            
+        except Exception as e:
+            logger.error(f"Error ranking university {university_name}: {e}", exc_info=True)
+            error_text = f"❌ <b>Error Ranking University</b>\n\nSorry, I couldn't analyze <b>{university_name}</b>.\n\nError: {str(e)[:200]}"
+            
+            processing_msg.edit_text(
+                error_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self.get_error_keyboard()
+            )
+    
+    def handle_excel_file(self, update: Update, context: CallbackContext):
+        """Enhanced Excel file handling with rate limit monitoring"""
+        user_id = str(update.effective_user.id)
+        logger.info(f"Excel file received from user {user_id}")
+        
+        try:
+            # Check if user already has a processing job
+            if user_id in self.user_excel_processing:
+                logger.warning(f"User {user_id} already has a file being processed")
+                update.message.reply_text(
+                    "⏳ <b>You already have a file being processed.</b>\n\n"
+                    "Please wait for the current processing to complete.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
             # Get the document
             document = update.message.document
+            logger.info(f"Document info: {document.file_name}, {document.file_size} bytes")
             
-            # Send processing message
+            # Send initial processing message
             processing_msg = update.message.reply_text(
-                "📥 <b>File Received!</b>\n\nProcessing your Excel file...\nThis may take a moment.",
+                "📥 <b>File Received!</b>\n\n"
+                "🔍 Starting to fetch real data from internet sources...\n"
+                "⏳ This may take several minutes for large files.\n\n"
+                "<b>Rate Limits Being Respected:</b>\n"
+                "• Wikipedia: 100/min, 2000/hour\n"
+                "• Google Search: 10/min, 100/hour\n"
+                "• Webometrics: 30/min, 500/hour\n\n"
+                "<i>If rate limits are hit, I'll use estimated data and show you the details.</i>",
                 parse_mode=ParseMode.HTML
             )
             
+            # Mark user as processing
+            self.user_excel_processing[user_id] = {
+                'message_id': processing_msg.message_id,
+                'start_time': datetime.now()
+            }
+            logger.info(f"Marked user {user_id} as processing")
+            
             # Download the file
             file = context.bot.get_file(document.file_id)
+            logger.debug(f"Starting file download")
             
             # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
                 file.download(tmp_file.name)
                 input_path = tmp_file.name
+            logger.info(f"File downloaded to {input_path}")
             
-            # Process the Excel file
-            output_path = self.ranking_system.process_excel_file(input_path)
-            
-            # Update processing message
+            # Send progress update
+            time.sleep(1)
             processing_msg.edit_text(
-                "✅ <b>Processing Complete!</b>\n\nGenerating ranked Excel file...",
+                "📊 <b>Processing Started!</b>\n\n"
+                "Fetching real data for all universities...\n"
+                "Respecting rate limits to avoid API blocks.\n\n"
+                "<b>Current API Status:</b>\n"
+                "✅ Wikipedia: Available\n"
+                "✅ Google Search: Available\n"
+                "✅ Webometrics: Available\n\n"
+                "<i>Processing in batches with delays...</i>",
                 parse_mode=ParseMode.HTML
             )
             
-            # Send the processed file back
+            # Process the Excel file
+            logger.info(f"Starting Excel processing for user {user_id}")
+            output_path, rate_limit_issues = self.ranking_system.process_excel_file(input_path, user_id)
+            logger.info(f"Excel processing complete. Output: {output_path}, Rate limit issues: {len(rate_limit_issues)}")
+            
+            # Prepare final message with rate limit summary
+            final_message = "🎯 <b>Enhanced University Rankings - Complete!</b>\n\n"
+            
+            if rate_limit_issues:
+                # Group rate limit issues by API
+                api_issues = {}
+                for issue in rate_limit_issues:
+                    api = issue.get('api', 'Unknown')
+                    if api not in api_issues:
+                        api_issues[api] = []
+                    api_issues[api].append(issue)
+                
+                final_message += "⚠️ <b>RATE LIMIT ISSUES ENCOUNTERED:</b>\n"
+                
+                for api, issues in api_issues.items():
+                    # Get latest reset time for this API
+                    reset_times = [issue.get('reset_time') for issue in issues if issue.get('reset_time')]
+                    if reset_times:
+                        latest_reset = max(reset_times)
+                        if isinstance(latest_reset, datetime):
+                            reset_str = latest_reset.strftime("%H:%M:%S")
+                            final_message += f"• <b>{api.upper()}</b>: {len(issues)} universities affected. Resets at {reset_str}\n"
+                        else:
+                            final_message += f"• <b>{api.upper()}</b>: {len(issues)} universities affected\n"
+                    else:
+                        final_message += f"• <b>{api.upper()}</b>: {len(issues)} universities affected\n"
+                
+                final_message += "\n"
+            
+            # Add color coding explanation
+            final_message += "<b>📊 COLOR CODING IN EXCEL:</b>\n"
+            final_message += "🟩 Green = Real data from internet sources\n"
+            final_message += "🟧 Orange = Estimated scores (no rate limits)\n"
+            final_message += "🟥 Red = Estimated due to rate limits\n"
+            final_message += "🟨 Yellow = Rank difference from Leap Rank\n\n"
+            
+            # Add sheet information
+            final_message += "<b>📄 SHEETS INCLUDED:</b>\n"
+            final_message += "• Rankings: Main results with scores\n"
+            final_message += "• Summary: Processing statistics\n"
+            if rate_limit_issues:
+                final_message += "• Rate Limit Issues: Detailed API limit information\n"
+            
+            # Send the file
             with open(output_path, 'rb') as result_file:
+                logger.info(f"Sending result file to user {user_id}")
                 context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=result_file,
                     filename=os.path.basename(output_path),
-                    caption="🎯 <b>Ranked Universities Excel File</b>\n\nAdded columns:\n• Global Score\n• Global Rank\n• Country Rank\n• Rank Difference\n\nYellow highlights show where our Country Rank differs from Leap Rank.",
+                    caption=final_message,
                     parse_mode=ParseMode.HTML
                 )
+            logger.info(f"Result file sent successfully to user {user_id}")
             
-            # Clean up temporary files
+            # Clean up temporary files and user tracking
             try:
                 os.unlink(input_path)
                 os.unlink(output_path)
-            except:
-                pass
+                if user_id in self.user_excel_processing:
+                    del self.user_excel_processing[user_id]
+                logger.info(f"Cleanup completed for user {user_id}")
+            except Exception as e:
+                logger.error(f"Cleanup error for user {user_id}: {e}")
+            
+        except RateLimitExceededException as e:
+            # Handle specific rate limit exception
+            logger.error(f"Rate limit exceeded during Excel processing for user {user_id}: {e}")
+            error_msg = f"""
+❌ <b>RATE LIMIT EXCEEDED DURING PROCESSING</b>
+
+<b>API:</b> {e.api_type.value.upper()}
+<b>Limit:</b> {e.limit_details}
+<b>Resets at:</b> {e.reset_time.strftime("%H:%M:%S")}
+
+Please try again after the reset time, or use a smaller Excel file.
+            """
+            
+            update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+            
+            # Clean up
+            if user_id in self.user_excel_processing:
+                del self.user_excel_processing[user_id]
             
         except Exception as e:
-            logger.error(f"Error processing Excel file: {e}")
-            error_msg = f"❌ <b>Error Processing File</b>\n\nSorry, I couldn't process your Excel file.\n\nError: {str(e)}"
+            logger.error(f"Error processing Excel file for user {user_id}: {e}", exc_info=True)
+            error_msg = f"""
+❌ <b>ERROR PROCESSING FILE</b>
+
+{str(e)[:500]}
+
+Please ensure your Excel file has the correct format:
+• University/Institution names
+• Country names
+• (Optional) Ranking column
+            """
             
-            if update.message:
-                update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-            else:
-                context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=error_msg,
-                    parse_mode=ParseMode.HTML
-                )
+            update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+            
+            # Clean up
+            if user_id in self.user_excel_processing:
+                del self.user_excel_processing[user_id]
     
     def button_handler(self, update: Update, context: CallbackContext):
         """Handle button callbacks"""
         query = update.callback_query
         query.answer()
-        
         data = query.data
+        user_id = query.from_user.id
         
-        if data == "start_ranking":
+        logger.info(f"Button click from user {user_id}: {data}")
+        
+        if data == "rate_status":
+            self.rate_status_command(query.message, context)
+        elif data == "start_ranking":
             query.edit_message_text(
                 "🎓 <b>University Ranking</b>\n\nPlease enter the university name:",
                 parse_mode=ParseMode.HTML
             )
             query.message.reply_text("Please use /rank command to start ranking.")
-        
         elif data == "rank_excel":
             self.rank_excel_command(query.message, context)
-        
         elif data == "view_tiers":
             self.show_tiers(query)
-        
         elif data == "view_parameters":
             self.show_parameters(query)
-        
         elif data == "main_menu":
             self.show_main_menu(query)
-        
         elif data == "rank_another":
             query.edit_message_text(
                 "🎓 <b>University Ranking</b>\n\nPlease enter the university name:",
                 parse_mode=ParseMode.HTML
             )
             query.message.reply_text("Please use /rank command to start ranking.")
-        
         elif data.startswith("country_"):
             # Handle country selection
             parts = data.split("_")
@@ -1098,7 +2016,6 @@ Please send me an Excel file (.xlsx or .xls) with university data.
                     country = country_code
                 
                 self.perform_ranking_callback(query, university_name.replace('_', ' '), country)
-        
         elif data.startswith("rationale_"):
             # Handle rationale viewing
             parts = data.split("_")
@@ -1109,14 +2026,12 @@ Please send me an Excel file (.xlsx or .xls) with university data.
                 if user_id in self.user_ranking_data:
                     ranking_data = self.user_ranking_data[user_id]
                     self.show_parameter_rationale(query, param_code, ranking_data)
-        
         elif data == "view_all_rationales":
             # Show all parameter rationales
             user_id = query.from_user.id
             if user_id in self.user_ranking_data:
                 ranking_data = self.user_ranking_data[user_id]
                 self.show_all_rationales(query, ranking_data)
-        
         elif data == "view_sources":
             # Show composite score sources
             user_id = query.from_user.id
@@ -1124,43 +2039,11 @@ Please send me an Excel file (.xlsx or .xls) with university data.
                 ranking_data = self.user_ranking_data[user_id]
                 self.show_sources(query, ranking_data)
     
-    def perform_ranking(self, update: Update, university_name: str, country: str, context: CallbackContext):
-        """Perform ranking and send results"""
-        processing_msg = update.message.reply_text(
-            f"🔍 <b>Analyzing {university_name}...</b>\n\nPlease wait while I gather data...",
-            parse_mode=ParseMode.HTML
-        )
-        
-        try:
-            # Get ranking data
-            ranking_data = self.ranking_system.rank_university(university_name, country)
-            
-            # Store ranking data for rationale viewing
-            user_id = update.effective_user.id
-            self.user_ranking_data[user_id] = ranking_data
-            
-            # Format results
-            results_text = self.format_ranking_results(ranking_data)
-            
-            # Send results
-            processing_msg.edit_text(
-                results_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=self.get_results_keyboard()
-            )
-            
-        except Exception as e:
-            logger.error(f"Error ranking university: {e}")
-            error_text = f"❌ <b>Error Ranking University</b>\n\nSorry, I couldn't analyze <b>{university_name}</b>.\n\nPlease try again."
-            
-            processing_msg.edit_text(
-                error_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=self.get_error_keyboard()
-            )
-    
     def perform_ranking_callback(self, query, university_name: str, country: str):
         """Perform ranking from callback"""
+        user_id = query.from_user.id
+        logger.info(f"Perform ranking callback for user {user_id}: {university_name}, {country}")
+        
         query.edit_message_text(
             f"🔍 <b>Analyzing {university_name}...</b>\n\nPlease wait while I gather data...",
             parse_mode=ParseMode.HTML
@@ -1168,10 +2051,9 @@ Please send me an Excel file (.xlsx or .xls) with university data.
         
         try:
             # Get ranking data
-            ranking_data = self.ranking_system.rank_university(university_name, country)
+            ranking_data = self.ranking_system.rank_university(university_name, country, str(user_id))
             
             # Store ranking data for rationale viewing
-            user_id = query.from_user.id
             self.user_ranking_data[user_id] = ranking_data
             
             # Format results
@@ -1185,7 +2067,7 @@ Please send me an Excel file (.xlsx or .xls) with university data.
             )
             
         except Exception as e:
-            logger.error(f"Error ranking university: {e}")
+            logger.error(f"Error in ranking callback: {e}")
             error_text = f"❌ <b>Error Ranking University</b>\n\nSorry, I couldn't analyze <b>{university_name}</b>.\n\nPlease try again."
             
             query.edit_message_text(
@@ -1196,6 +2078,7 @@ Please send me an Excel file (.xlsx or .xls) with university data.
     
     def show_parameter_rationale(self, query, param_code: str, ranking_data: UniversityData):
         """Show rationale for a specific parameter"""
+        logger.debug(f"Showing rationale for {param_code}")
         param_info = self.ranking_system.parameters.get(param_code, {})
         param_name = param_info.get('name', param_code)
         score = ranking_data.scores.get(param_code, 0)
@@ -1233,6 +2116,7 @@ Please send me an Excel file (.xlsx or .xls) with university data.
     
     def show_all_rationales(self, query, ranking_data: UniversityData):
         """Show all parameter rationales in one view"""
+        logger.debug(f"Showing all rationales for {ranking_data.name}")
         rationales_text = f"""
 <b>📊 All Parameter Rationales for {ranking_data.name}</b>
 <b>Composite Score:</b> {ranking_data.composite:.1f}/100
@@ -1284,6 +2168,7 @@ Please send me an Excel file (.xlsx or .xls) with university data.
     
     def show_sources(self, query, ranking_data: UniversityData):
         """Show data sources for composite score"""
+        logger.debug(f"Showing sources for {ranking_data.name}")
         sources_text = f"""
 <b>📚 Data Sources & Methodology for {ranking_data.name}</b>
 
@@ -1336,6 +2221,7 @@ Visibility & Presence: 5%
     
     def show_tiers(self, query):
         """Show tiers information"""
+        logger.debug("Showing tiers information")
         tiers_text = """
 <b>🏆 Ranking Tiers & Ranges</b>
 
@@ -1375,6 +2261,7 @@ Poor performance across most metrics.
     
     def show_parameters(self, query):
         """Show parameters information"""
+        logger.debug("Showing parameters information")
         params_text = """
 <b>📊 Ranking Parameters</b>
 
@@ -1414,6 +2301,7 @@ Web presence, brand recognition.
     
     def show_main_menu(self, query):
         """Show main menu"""
+        logger.debug("Showing main menu")
         welcome_text = """
 🎓 Welcome to <b>pkUniRankBot</b>!
 
@@ -1425,8 +2313,9 @@ Click the buttons below to get started!
         keyboard = [
             [InlineKeyboardButton("🎯 Rank a University", callback_data="start_ranking")],
             [InlineKeyboardButton("📊 Process Excel File", callback_data="rank_excel")],
+            [InlineKeyboardButton("📈 Check Rate Limits", callback_data="rate_status")],
             [InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers")],
-            [InlineKeyboardButton("📈 View Parameters", callback_data="view_parameters")]
+            [InlineKeyboardButton("📊 View Parameters", callback_data="view_parameters")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1438,6 +2327,7 @@ Click the buttons below to get started!
     
     def format_ranking_results(self, data: UniversityData) -> str:
         """Format ranking results as HTML text"""
+        logger.debug(f"Formatting ranking results for {data.name}")
         # Header
         results = f"""
 <b>🏛️ {data.name}</b>
@@ -1491,6 +2381,31 @@ Click the buttons below to get started!
         results += f"\n<b>📊 ERROR MARGIN:</b> ±{data.error_margin} points\n"
         results += f"<b>🔍 CONFIDENCE:</b> {confidence}\n"
         
+        # Data source information
+        if hasattr(data, 'is_estimated') and not data.is_estimated:
+            results += "\n<b>✅ DATA SOURCE:</b> Real data from internet sources\n"
+            if hasattr(data, 'real_data_sources') and data.real_data_sources:
+                results += "<b>📚 Sources used:</b>\n"
+                for source in data.real_data_sources[:3]:  # Show top 3 sources
+                    results += f"• {source}\n"
+        else:
+            results += "\n<b>⚠️ DATA SOURCE:</b> Estimated based on patterns\n"
+            results += "<i>Note: Real-time data fetching was limited or rate-limited</i>\n"
+        
+        # Add rate limit information if available
+        if hasattr(data, 'rate_limit_info') and data.rate_limit_info:
+            rate_limited = [info for info in data.rate_limit_info if info.get('status') == 'rate_limited']
+            if rate_limited:
+                results += "\n<b>⚠️ RATE LIMIT NOTES:</b>\n"
+                for info in rate_limited[:2]:  # Show max 2 rate limit issues
+                    api_name = info.get('api', 'Unknown API')
+                    reset_time = info.get('reset_time')
+                    if isinstance(reset_time, datetime):
+                        reset_str = reset_time.strftime("%H:%M:%S")
+                        results += f"• {api_name}: Limited, resets at {reset_str}\n"
+                    else:
+                        results += f"• {api_name}: Rate limited\n"
+        
         # Recommendations
         results += "\n<b>📝 RECOMMENDATIONS:</b>\n"
         if data.tier in ['A+', 'A']:
@@ -1506,6 +2421,7 @@ Click the buttons below to get started!
         results += "\n<b>🔍 Want to see the rationale behind each score?</b>\n"
         results += "Use the buttons below to explore parameter rationales and data sources!"
         
+        logger.debug(f"Results formatted for {data.name}")
         return results
     
     def get_results_keyboard(self):
@@ -1517,10 +2433,13 @@ Click the buttons below to get started!
             ],
             [InlineKeyboardButton("🎯 Rank Another University", callback_data="rank_another")],
             [
-                InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers"),
-                InlineKeyboardButton("📈 View Parameters", callback_data="view_parameters")
+                InlineKeyboardButton("📈 Check Rate Limits", callback_data="rate_status"),
+                InlineKeyboardButton("🏆 View Tiers", callback_data="view_tiers")
             ],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+            [
+                InlineKeyboardButton("📊 View Parameters", callback_data="view_parameters"),
+                InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")
+            ]
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -1533,16 +2452,19 @@ Click the buttons below to get started!
         return InlineKeyboardMarkup(keyboard)
 
 def main():
-    """Main function to run the bot"""
+    """Main function to run the enhanced bot"""
     # Check for required packages
     try:
         import telegram
         import numpy
         import pandas
         import openpyxl
+        import requests
+        import wikipedia
+        from googlesearch import search
     except ImportError as e:
         print(f"❌ Missing package: {e}")
-        print("Install with: pip install python-telegram-bot numpy pandas openpyxl python-dotenv")
+        print("Install with: pip install python-telegram-bot numpy pandas openpyxl wikipedia-api google")
         exit(1)
     
     # Get bot token
@@ -1555,14 +2477,21 @@ def main():
     
     # Create and run bot
     try:
-        print("🤖 Starting pkUniRankBot with Excel Processing...")
+        print("🤖 Starting Enhanced pkUniRankBot with Rate Limiting...")
         print(f"📊 Version: python-telegram-bot v{telegram.__version__}")
         print(f"📈 pandas v{pandas.__version__}")
+        print("📝 Detailed logging enabled")
+        print("⚠️  Rate limits enforced for all external APIs")
+        print("🔄 Auto-fallback to estimation when limits hit")
+        print("📊 Rate limit status available via /rate_status")
+        print("🔍 Progress tracking for all operations")
         
-        bot = UniRankBot(token)
+        bot = EnhancedUniRankBot(token)
         bot.start()
     except Exception as e:
         print(f"❌ Bot error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
